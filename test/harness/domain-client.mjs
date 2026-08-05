@@ -1,0 +1,62 @@
+#!/usr/bin/env node
+import { openDomain } from "../../dist/index.js";
+
+const command = process.argv[2] ?? "snapshot";
+const timeoutMs = Number(process.env.TEST_CONNECT_TIMEOUT_MS ?? 4000);
+
+function output(value) {
+  process.stdout.write(`${JSON.stringify(value, (_key, item) => typeof item === "bigint" ? item.toString() : item)}\n`);
+}
+
+try {
+  const { domain, created } = await openDomain({
+    initialActivity: process.env.TEST_ACTIVITY === "busy" ? "busy" : "idle",
+    connectTimeoutMs: timeoutMs,
+  });
+
+  if (command === "hold") {
+    output({ ready: true, created, snapshot: domain.snapshot() });
+    const finish = async () => {
+      await domain.close();
+      process.exit(0);
+    };
+    process.on("SIGTERM", () => void finish());
+    process.on("SIGINT", () => void finish());
+    setInterval(() => {}, 60_000);
+  }
+  else if (command === "reservation") {
+    const reservation = await domain.reserveSpawn({ ttlMs: Number(process.env.TEST_TTL_MS ?? 2000) });
+    output({ created, env: reservation.env, snapshot: domain.snapshot() });
+    if (process.env.TEST_CANCEL === "1") await reservation.cancel();
+    await domain.close();
+  }
+  else if (command === "restart") {
+    const before = domain.snapshot();
+    process.kill(Number(process.env.TEST_BROKER_PID), "SIGKILL");
+    const until = Date.now() + 9000;
+    while (Date.now() < until && domain.snapshot().brokerEpoch === before.brokerEpoch) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    output({ created, before, after: domain.snapshot(), confirmedOldFence: await domain.confirm(before.fence) });
+    await domain.close();
+  }
+  else if (command === "transitions") {
+    const observed = [];
+    const unsubscribe = domain.subscribe((snapshot) => observed.push(snapshot));
+    const before = domain.snapshot();
+    const busy = await domain.setActivity("busy");
+    const oldFenceConfirmed = await domain.confirm(before.fence);
+    const idle = await domain.setActivity("idle");
+    unsubscribe();
+    output({ created, before, busy, idle, observed, oldFenceConfirmed, confirmed: await domain.confirm(idle.fence) });
+    await domain.close();
+  }
+  else {
+    output({ created, snapshot: domain.snapshot() });
+    await domain.close();
+  }
+}
+catch (error) {
+  output({ error: error?.name ?? "Error", code: error?.code ?? "UNKNOWN", message: error?.message ?? String(error) });
+  process.exitCode = 78;
+}

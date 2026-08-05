@@ -1,0 +1,12 @@
+node_modules/
+*.log
+.DS_Store
+runtime-test/
+.pi/
+.pi-subagents/
+.serena/
+
+# Distribution is intentionally committed so Git installs need no build tool.
+!dist/
+!dist/**/*.js
+!dist/**/*.d.ts
