@@ -37,6 +37,7 @@ describe("declaration", () => {
     expect(read!.domainId).toBe(decl.domainId);
     expect(Buffer.from(read!.domainKey).equals(Buffer.from(decl.domainKey))).toBe(true);
     expect(read!.protocolMajor).toBe(1);
+    expect(read!.protocolMinor).toBe(0);
   });
 
   it("fails closed on a partial declaration", () => {
@@ -51,10 +52,13 @@ describe("declaration", () => {
     expect(() => readDeclaration()).toThrow(ProcessDomainFatalError);
   });
 
-  it("fails closed on a protocol major mismatch", () => {
+  it("fails closed on an unsupported protocol version", () => {
     process.env[ENV.DOMAIN_ID] = "domain-two-abc";
     process.env[ENV.DOMAIN_KEY] = base64url(new Uint8Array(32).fill(1));
     process.env[ENV.PROTOCOL] = "999.0";
+    expect(() => readDeclaration()).toThrow(/incompatible/i);
+
+    process.env[ENV.PROTOCOL] = "1.999";
     expect(() => readDeclaration()).toThrow(/incompatible/i);
   });
 });

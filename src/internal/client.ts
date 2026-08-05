@@ -25,7 +25,7 @@ import {
 } from "./auth.js";
 import { decodeReservationClaim, type DomainDeclaration } from "./declaration.js";
 import { computeSnapshot, type ActivityState, type DomainFence, type DomainSnapshot } from "./domain-types.js";
-import { PROCESS_DOMAIN_PROTOCOL_MAJOR, ProcessDomainFatalError, isProcessDomainFatalError, type ProcessDomainFatalCode } from "./errors.js";
+import { PROCESS_DOMAIN_PROTOCOL_MAJOR, PROCESS_DOMAIN_PROTOCOL_MINOR, ProcessDomainFatalError, isProcessDomainFatalError, type ProcessDomainFatalCode } from "./errors.js";
 import { type CanonicalObject } from "./framing.js";
 import { RawChannel, createRpcPeer } from "./rpc.js";
 import { resolveEndpoint, type RuntimeEndpoint } from "./runtime-path.js";
@@ -288,6 +288,14 @@ export class DomainClient {
 
     const brokerNonceRaw = unbase64url(typeof challenge.brokerNonce === "string" ? challenge.brokerNonce : "", 16);
     const brokerEpoch = typeof challenge.brokerEpoch === "string" ? challenge.brokerEpoch : "";
+    const brokerMajor = challenge.protocolMajor;
+    const brokerMinor = challenge.protocolMinor;
+    if (
+      typeof brokerMajor !== "number" || !Number.isInteger(brokerMajor) || brokerMajor !== PROCESS_DOMAIN_PROTOCOL_MAJOR ||
+      typeof brokerMinor !== "number" || !Number.isInteger(brokerMinor) || brokerMinor !== PROCESS_DOMAIN_PROTOCOL_MINOR
+    ) {
+      throw new ProcessDomainFatalError("PROTOCOL_MISMATCH", "broker selected an unsupported protocol version");
+    }
     if (!brokerNonceRaw || !brokerEpoch) {
       throw new ProcessDomainFatalError("AUTHENTICATION_FAILED", "broker returned a malformed challenge");
     }

@@ -49,8 +49,8 @@ function parseDeclaration() {
     if (parts.length !== 2 || !Number.isInteger(major) || !Number.isInteger(minor)) {
         throw new ProcessDomainFatalError("INVALID_DECLARATION", "protocol string is malformed");
     }
-    if (major !== PROCESS_DOMAIN_PROTOCOL_MAJOR) {
-        throw new ProcessDomainFatalError("PROTOCOL_MISMATCH", `protocol major ${major} is incompatible with supported ${PROCESS_DOMAIN_PROTOCOL_MAJOR}`);
+    if (major !== PROCESS_DOMAIN_PROTOCOL_MAJOR || minor !== PROCESS_DOMAIN_PROTOCOL_MINOR) {
+        throw new ProcessDomainFatalError("PROTOCOL_MISMATCH", `protocol ${major}.${minor} is incompatible with supported ${protocolString()}`);
     }
     return { domainId: id, domainKey: keyBytes, protocolMajor: major, protocolMinor: minor };
 }

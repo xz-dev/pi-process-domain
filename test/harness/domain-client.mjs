@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readFile } from "node:fs/promises";
 import { openDomain } from "../../dist/index.js";
 
 const command = process.argv[2] ?? "snapshot";
@@ -8,11 +9,16 @@ function output(value) {
   process.stdout.write(`${JSON.stringify(value, (_key, item) => typeof item === "bigint" ? item.toString() : item)}\n`);
 }
 
+let overriddenFatal = null;
 try {
-  const { domain, created } = await openDomain({
+  const options = {
     initialActivity: process.env.TEST_ACTIVITY === "busy" ? "busy" : "idle",
     connectTimeoutMs: timeoutMs,
-  });
+  };
+  if (process.env.TEST_FATAL_OVERRIDE === "1") {
+    options.onFatal = (error) => { overriddenFatal = error?.code ?? error?.name ?? "Error"; };
+  }
+  const { domain, created } = await openDomain(options);
 
   if (command === "hold") {
     output({ ready: true, created, snapshot: domain.snapshot() });
@@ -32,12 +38,20 @@ try {
   }
   else if (command === "restart") {
     const before = domain.snapshot();
-    process.kill(Number(process.env.TEST_BROKER_PID), "SIGKILL");
+    const brokerPid = Number(JSON.parse(await readFile(process.env.TEST_BROKER_CLAIM, "utf8")).pid);
+    process.kill(brokerPid, "SIGKILL");
     const until = Date.now() + 9000;
     while (Date.now() < until && domain.snapshot().brokerEpoch === before.brokerEpoch) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    output({ created, before, after: domain.snapshot(), confirmedOldFence: await domain.confirm(before.fence) });
+    output({
+      created,
+      launcherPid: process.pid,
+      killedBrokerPid: brokerPid,
+      before,
+      after: domain.snapshot(),
+      confirmedOldFence: await domain.confirm(before.fence),
+    });
     await domain.close();
   }
   else if (command === "transitions") {
@@ -51,12 +65,22 @@ try {
     output({ created, before, busy, idle, observed, oldFenceConfirmed, confirmed: await domain.confirm(idle.fence) });
     await domain.close();
   }
+  else if (command === "caught") {
+    output({ created, snapshot: domain.snapshot() });
+    await domain.close();
+  }
   else {
     output({ created, snapshot: domain.snapshot() });
     await domain.close();
   }
 }
 catch (error) {
-  output({ error: error?.name ?? "Error", code: error?.code ?? "UNKNOWN", message: error?.message ?? String(error) });
-  process.exitCode = 78;
+  output({
+    error: error?.name ?? "Error",
+    code: error?.code ?? "UNKNOWN",
+    message: error?.message ?? String(error),
+    exitCode: process.exitCode ?? null,
+    overriddenFatal,
+  });
+  if (command !== "caught") process.exitCode = 78;
 }

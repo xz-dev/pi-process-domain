@@ -33,26 +33,48 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
  * than being silently ignored or regenerated.
  */
 export async function openDomain(options) {
-    const existing = readDeclaration();
-    const created = existing === null;
-    const declaration = existing ?? createDeclaration();
-    const timeout = options?.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
-    if (!Number.isFinite(timeout) || timeout <= 0) {
-        throw new ProcessDomainFatalError("INVALID_DECLARATION", "connectTimeoutMs must be a positive finite number");
+    const defaultFatal = (error) => {
+        process.exitCode = FATAL_EXIT_CODE;
+        console.error(`pi-process-domain fatal: ${error.message}`);
+    };
+    const onFatal = options?.onFatal ?? defaultFatal;
+    let client = null;
+    try {
+        const existing = readDeclaration();
+        const created = existing === null;
+        const declaration = existing ?? createDeclaration();
+        const timeout = options?.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+        if (!Number.isFinite(timeout) || timeout <= 0) {
+            throw new ProcessDomainFatalError("INVALID_DECLARATION", "connectTimeoutMs must be a positive finite number");
+        }
+        client = new DomainClient({
+            declaration,
+            initialActivity: options?.initialActivity ?? "idle",
+            metadata: options?.metadata ?? {},
+            connectTimeoutMs: timeout,
+            onFatal,
+            createDomain: created,
+        });
+        await client.open();
+        return { domain: client, created };
     }
-    const client = new DomainClient({
-        declaration,
-        initialActivity: options?.initialActivity ?? "idle",
-        metadata: options?.metadata ?? {},
-        connectTimeoutMs: timeout,
-        onFatal: options?.onFatal ?? ((error) => {
-            process.exitCode = FATAL_EXIT_CODE;
-            console.error(`pi-process-domain fatal: ${error.message}`);
-        }),
-        createDomain: created,
-    });
-    await client.open();
-    return { domain: client, created };
+    catch (error) {
+        const fatal = isProcessDomainFatalError(error)
+            ? error
+            : new ProcessDomainFatalError("INVALID_DECLARATION", "failed to configure process domain", error);
+        if (client === null) {
+            if (options?.onFatal === undefined)
+                defaultFatal(fatal);
+            else {
+                process.exitCode = FATAL_EXIT_CODE;
+                try {
+                    onFatal(fatal);
+                }
+                catch { /* preserve the original typed failure */ }
+            }
+        }
+        throw fatal;
+    }
 }
 /** Resolve the per-user broker endpoint (path or named pipe) for diagnostics. */
 export function brokerEndpoint() {

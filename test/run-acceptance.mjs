@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile, chmod } from "node:fs/promises";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -8,10 +9,13 @@ import { fileURLToPath } from "node:url";
 import net from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { brokerEndpoint } from "../dist/index.js";
+import { lockDir } from "../dist/internal/launcher.js";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const harness = join(root, "test/harness/domain-client.mjs");
-const brokerBin = join(root, "bin/pi-process-domain-broker.mjs");
+const testRuntime = await mkdtemp(join(tmpdir(), "pi-process-domain-runtime-"));
+process.env.XDG_RUNTIME_DIR = testRuntime;
+process.on("exit", () => rmSync(testRuntime, { recursive: true, force: true }));
 const baseEnv = { ...process.env };
 for (const key of ["PI_PROCESS_DOMAIN_ID", "PI_PROCESS_DOMAIN_KEY", "PI_PROCESS_DOMAIN_PROTOCOL", "PI_PROCESS_DOMAIN_RESERVATION"]) delete baseEnv[key];
 const deadlineMs = 10_000;
@@ -70,13 +74,25 @@ async function scenario(name, fn) {
   console.log(`ok ${passed} - ${name}`);
 }
 
-async function killBrokers() {
-  if (process.platform === "win32") return;
-  const result = await run("pgrep", ["-f", brokerBin]);
-  if (result.code !== 0) return;
-  for (const pid of result.stdout.trim().split("\n").filter(Boolean)) {
-    try { process.kill(Number(pid), "SIGKILL"); } catch { /* already gone */ }
+function brokerClaimPath() {
+  return join(lockDir(), "election.lock", "claim.json");
+}
+
+async function readBrokerPid() {
+  const until = Date.now() + deadlineMs;
+  while (Date.now() < until) {
+    try {
+      const claim = JSON.parse(await readFile(brokerClaimPath(), "utf8"));
+      if (Number.isInteger(claim.pid) && claim.pid > 0) return claim.pid;
+    }
+    catch { /* broker has not claimed ownership yet */ }
+    await delay(50);
   }
+  throw new Error("broker ownership claim did not become ready");
+}
+
+async function killBroker() {
+  try { process.kill(await readBrokerPid(), "SIGKILL"); } catch { /* already gone */ }
   await delay(250);
 }
 
@@ -90,7 +106,7 @@ function declarationFromReservation(env) {
 }
 
 await scenario("new domain and declared join across processes", async () => {
-  await killBrokers();
+  await killBroker();
   const reservation = await run(process.execPath, [harness, "reservation"], { env: baseEnv });
   assert.equal(reservation.code, 0);
   const reservationData = parseLast(reservation);
@@ -102,8 +118,31 @@ await scenario("new domain and declared join across processes", async () => {
 await scenario("missing malformed and wrong declared keys fail nonzero", async () => {
   const partial = await run(process.execPath, [harness], { env: { ...baseEnv, PI_PROCESS_DOMAIN_ID: "valid-domain-id" } });
   assert.notEqual(partial.code, 0);
+  const caught = await run(process.execPath, [harness, "caught"], { env: { ...baseEnv, PI_PROCESS_DOMAIN_ID: "valid-domain-id" } });
+  assert.equal(caught.code, 78, caught.stderr);
+  const caughtData = parseLast(caught);
+  assert.equal(caughtData.code, "INVALID_DECLARATION");
+  assert.equal(caughtData.exitCode, 78);
+  const overridden = await run(process.execPath, [harness, "caught"], {
+    env: { ...baseEnv, PI_PROCESS_DOMAIN_ID: "valid-domain-id", TEST_FATAL_OVERRIDE: "1" },
+  });
+  assert.equal(overridden.code, 78, overridden.stderr);
+  const overriddenData = parseLast(overridden);
+  assert.equal(overriddenData.code, "INVALID_DECLARATION");
+  assert.equal(overriddenData.overriddenFatal, "INVALID_DECLARATION");
   const malformed = await run(process.execPath, [harness], { env: { ...baseEnv, PI_PROCESS_DOMAIN_ID: "valid-domain-id", PI_PROCESS_DOMAIN_KEY: "!!!", PI_PROCESS_DOMAIN_PROTOCOL: "1.0" } });
   assert.notEqual(malformed.code, 0);
+  const minor = await run(process.execPath, [harness], {
+    env: {
+      ...baseEnv,
+      PI_PROCESS_DOMAIN_ID: "valid-domain-id",
+      PI_PROCESS_DOMAIN_KEY: Buffer.alloc(32, 1).toString("base64url"),
+      PI_PROCESS_DOMAIN_PROTOCOL: "1.999",
+    },
+  });
+  assert.equal(minor.code, 78, minor.stderr);
+  assert.equal(parseLast(minor).code, "PROTOCOL_MISMATCH");
+
   const reservationResult = await run(process.execPath, [harness, "reservation"], { env: baseEnv });
   assert.equal(reservationResult.code, 0, reservationResult.stderr);
   const reservation = parseLast(reservationResult);
@@ -156,16 +195,17 @@ await scenario("broker restart creates a new epoch and fails closed during recov
   const madeResult = await run(process.execPath, [harness, "reservation"], { env: baseEnv });
   assert.equal(madeResult.code, 0, madeResult.stderr);
   const made = parseLast(madeResult);
-  const pidResult = await run("pgrep", ["-f", brokerBin]);
-  assert.equal(pidResult.code, 0, pidResult.stderr);
-  const brokerPid = pidResult.stdout.trim().split("\n").filter(Boolean).at(-1);
+  const originalBrokerPid = await readBrokerPid();
   const restarted = await run(process.execPath, [harness, "restart"], {
-    env: { ...declarationFromReservation(made.env), TEST_BROKER_PID: brokerPid },
+    env: { ...declarationFromReservation(made.env), TEST_BROKER_CLAIM: brokerClaimPath() },
     timeout: 15_000,
   });
   assert.equal(restarted.code, 0, restarted.stderr);
   const data = parseLast(restarted);
+  assert.equal(data.killedBrokerPid, originalBrokerPid);
+  assert.notEqual(data.launcherPid, originalBrokerPid);
   assert.notEqual(data.after.brokerEpoch, data.before.brokerEpoch);
+  assert.notEqual(await readBrokerPid(), originalBrokerPid);
   assert.equal(data.after.certain, false);
   assert.equal(data.after.allIdle, false);
   assert.equal(data.confirmedOldFence, false);
@@ -187,7 +227,7 @@ await scenario("malformed and oversized frames are rejected without killing brok
 
 await scenario("concurrent launch and stale socket recovery", async () => {
   const endpoint = brokerEndpoint();
-  await killBrokers();
+  await killBroker();
   if (process.platform !== "win32") await writeFile(endpoint, "stale", { mode: 0o600 }).catch(() => {});
   const results = await Promise.all(Array.from({ length: 8 }, () => run(process.execPath, [harness], { env: baseEnv, timeout: 12_000 })));
   assert.ok(results.every((item) => item.code === 0), results.map((item) => item.stderr).join("\n"));

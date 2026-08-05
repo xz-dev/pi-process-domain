@@ -60,14 +60,15 @@ import {
   type ParticipantLease,
   type ReservationLease,
 } from "./broker-state.js";
-import { PROCESS_DOMAIN_PROTOCOL_MAJOR, ProcessDomainFatalError } from "./errors.js";
+import { PROCESS_DOMAIN_PROTOCOL_MAJOR, PROCESS_DOMAIN_PROTOCOL_MINOR, ProcessDomainFatalError } from "./errors.js";
 import { type CanonicalObject } from "./framing.js";
 import { RawChannel, createRpcPeer } from "./rpc.js";
 import { resolveEndpoint, type RuntimeEndpoint } from "./runtime-path.js";
-import { tryAcquireElection, reclaimStaleElection, releaseElection } from "./launcher.js";
+import { claimElectionForBroker, tryAcquireElection, reclaimStaleElection, releaseElection } from "./launcher.js";
 
 export interface BrokerOptions {
   endpoint: RuntimeEndpoint;
+  electionOwner?: string;
 }
 
 interface Conn {
@@ -118,8 +119,10 @@ export class Broker {
   private domains = new Map<string, DomainState>();
   private conns = new Set<Conn>();
   private server: Server;
+  private electionOwner: string | null;
 
   constructor(private options: BrokerOptions) {
+    this.electionOwner = options.electionOwner ?? null;
     this.server = net.createServer((socket) => this.onConnection(socket));
   }
 
@@ -232,8 +235,12 @@ export class Broker {
     if (!raw) return;
 
     if (frame.t === "hello") {
-      const major = Number(frame.protocolMajor);
-      if (!Number.isInteger(major) || major !== PROCESS_DOMAIN_PROTOCOL_MAJOR) {
+      const major = frame.protocolMajor;
+      const minor = frame.protocolMinor;
+      if (
+        typeof major !== "number" || !Number.isInteger(major) || major !== PROCESS_DOMAIN_PROTOCOL_MAJOR ||
+        typeof minor !== "number" || !Number.isInteger(minor) || minor !== PROCESS_DOMAIN_PROTOCOL_MINOR
+      ) {
         raw.send({ t: "error", code: "PROTOCOL_MISMATCH" });
         raw.destroy();
         return;
@@ -276,6 +283,8 @@ export class Broker {
       conn.brokerNonce = brokerNonce;
       raw.send({
         t: "challenge",
+        protocolMajor: PROCESS_DOMAIN_PROTOCOL_MAJOR,
+        protocolMinor: PROCESS_DOMAIN_PROTOCOL_MINOR,
         brokerEpoch: state.brokerEpoch,
         brokerNonce: Buffer.from(brokerNonce).toString("base64url"),
       });
@@ -754,19 +763,25 @@ export class Broker {
         /* ignore */
       }
     }
-    releaseElection();
+    if (this.electionOwner !== null) releaseElection(this.electionOwner);
   }
 }
 
 /** Launch a broker for the current user endpoint (used by the CLI harness). */
-export async function launchBrokerForCurrentUser(): Promise<Broker> {
+export async function launchBrokerForCurrentUser(electionOwner?: string): Promise<Broker> {
   reclaimStaleElection();
   const endpoint = resolveEndpoint();
-  const won = tryAcquireElection();
-  if (!won) {
+  const owner = electionOwner ?? tryAcquireElection();
+  if (owner === null || !claimElectionForBroker(owner)) {
     throw new ProcessDomainFatalError("BROKER_UNAVAILABLE", "another broker holds the election lock");
   }
-  const broker = new Broker({ endpoint });
-  await broker.start();
-  return broker;
+  const broker = new Broker({ endpoint, electionOwner: owner });
+  try {
+    await broker.start();
+    return broker;
+  }
+  catch (error) {
+    releaseElection(owner);
+    throw error;
+  }
 }

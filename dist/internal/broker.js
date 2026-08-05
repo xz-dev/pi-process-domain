@@ -21,11 +21,11 @@ import * as net from "node:net";
 import * as fs from "node:fs";
 import { clientMac, deriveDomainAuthKey, macEqual, randomNonce, serverMac, unbase64url, } from "./auth.js";
 import { DEFAULT_HEARTBEAT_MS, EXPIRE_MS, MAX_DOMAIN_ID_LENGTH, MAX_INCARNATION, MAX_METADATA_KEYS, MAX_METADATA_KEY_LENGTH, MAX_METADATA_VALUE_LENGTH, MAX_PARTICIPANT_ID_LENGTH, MAX_PARTICIPANTS_PER_DOMAIN, MAX_RESERVATIONS_PER_DOMAIN, MAX_RESERVATIONS_PER_PARTICIPANT, MAX_SIGNAL_NAME_LENGTH, MAX_SIGNAL_VALUE_BYTES, MIN_INCARNATION, MIN_RESERVATION_TTL_MS, RESERVATION_MAX_TTL_MS, RESERVATION_TTL_MS, SUSPECT_MS, hashToken, makeParticipantId, makeReservationId, makeResumeKey, newDomain, reservationToken, snapshotOf, snapshotToWire, } from "./broker-state.js";
-import { PROCESS_DOMAIN_PROTOCOL_MAJOR, ProcessDomainFatalError } from "./errors.js";
+import { PROCESS_DOMAIN_PROTOCOL_MAJOR, PROCESS_DOMAIN_PROTOCOL_MINOR, ProcessDomainFatalError } from "./errors.js";
 import {} from "./framing.js";
 import { RawChannel, createRpcPeer } from "./rpc.js";
 import { resolveEndpoint } from "./runtime-path.js";
-import { tryAcquireElection, reclaimStaleElection, releaseElection } from "./launcher.js";
+import { claimElectionForBroker, tryAcquireElection, reclaimStaleElection, releaseElection } from "./launcher.js";
 function wireSnapshot(state) {
     return snapshotToWire(snapshotOf(state));
 }
@@ -57,8 +57,10 @@ export class Broker {
     domains = new Map();
     conns = new Set();
     server;
+    electionOwner;
     constructor(options) {
         this.options = options;
+        this.electionOwner = options.electionOwner ?? null;
         this.server = net.createServer((socket) => this.onConnection(socket));
     }
     async start() {
@@ -156,8 +158,10 @@ export class Broker {
         if (!raw)
             return;
         if (frame.t === "hello") {
-            const major = Number(frame.protocolMajor);
-            if (!Number.isInteger(major) || major !== PROCESS_DOMAIN_PROTOCOL_MAJOR) {
+            const major = frame.protocolMajor;
+            const minor = frame.protocolMinor;
+            if (typeof major !== "number" || !Number.isInteger(major) || major !== PROCESS_DOMAIN_PROTOCOL_MAJOR ||
+                typeof minor !== "number" || !Number.isInteger(minor) || minor !== PROCESS_DOMAIN_PROTOCOL_MINOR) {
                 raw.send({ t: "error", code: "PROTOCOL_MISMATCH" });
                 raw.destroy();
                 return;
@@ -200,6 +204,8 @@ export class Broker {
             conn.brokerNonce = brokerNonce;
             raw.send({
                 t: "challenge",
+                protocolMajor: PROCESS_DOMAIN_PROTOCOL_MAJOR,
+                protocolMinor: PROCESS_DOMAIN_PROTOCOL_MINOR,
                 brokerEpoch: state.brokerEpoch,
                 brokerNonce: Buffer.from(brokerNonce).toString("base64url"),
             });
@@ -669,18 +675,25 @@ export class Broker {
                 /* ignore */
             }
         }
-        releaseElection();
+        if (this.electionOwner !== null)
+            releaseElection(this.electionOwner);
     }
 }
 /** Launch a broker for the current user endpoint (used by the CLI harness). */
-export async function launchBrokerForCurrentUser() {
+export async function launchBrokerForCurrentUser(electionOwner) {
     reclaimStaleElection();
     const endpoint = resolveEndpoint();
-    const won = tryAcquireElection();
-    if (!won) {
+    const owner = electionOwner ?? tryAcquireElection();
+    if (owner === null || !claimElectionForBroker(owner)) {
         throw new ProcessDomainFatalError("BROKER_UNAVAILABLE", "another broker holds the election lock");
     }
-    const broker = new Broker({ endpoint });
-    await broker.start();
-    return broker;
+    const broker = new Broker({ endpoint, electionOwner: owner });
+    try {
+        await broker.start();
+        return broker;
+    }
+    catch (error) {
+        releaseElection(owner);
+        throw error;
+    }
 }

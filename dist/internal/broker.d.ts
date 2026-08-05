@@ -20,12 +20,14 @@
 import { type RuntimeEndpoint } from "./runtime-path.js";
 export interface BrokerOptions {
     endpoint: RuntimeEndpoint;
+    electionOwner?: string;
 }
 export declare class Broker {
     private options;
     private domains;
     private conns;
     private server;
+    private electionOwner;
     constructor(options: BrokerOptions);
     start(): Promise<void>;
     /** Connect to the endpoint and confirm a live broker answers (or the socket is absent). */
@@ -52,4 +54,4 @@ export declare class Broker {
     close(): Promise<void>;
 }
 /** Launch a broker for the current user endpoint (used by the CLI harness). */
-export declare function launchBrokerForCurrentUser(): Promise<Broker>;
+export declare function launchBrokerForCurrentUser(electionOwner?: string): Promise<Broker>;

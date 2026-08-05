@@ -42,7 +42,7 @@ The first process with no declaration creates a random domain and writes these v
 - `PI_PROCESS_DOMAIN_KEY`
 - `PI_PROCESS_DOMAIN_PROTOCOL`
 
-Any partial or malformed declaration fails closed. A declared domain with a wrong key, absent broker state, rejected lease, or incompatible protocol rejects `openDomain()` with `ProcessDomainFatalError`. The default fatal handler also sets `process.exitCode` to `FATAL_EXIT_CODE` (78); applications may provide `onFatal` for their own logging/shutdown policy.
+Any partial or malformed declaration fails closed. Protocol v1 supports exactly version `1.0`; any other major or minor rejects with `PROTOCOL_MISMATCH`. A declared domain with a wrong key, absent broker state, rejected lease, or incompatible protocol rejects `openDomain()` with `ProcessDomainFatalError`. Initial `openDomain()` failures preserve fail-closed process status by setting `process.exitCode` to `FATAL_EXIT_CODE` (78), even when the rejection is caught. Applications may provide `onFatal` to replace default logging and receive the error, but not to opt out of the initial fail-closed exit status.
 
 ## Reservation-before-spawn
 

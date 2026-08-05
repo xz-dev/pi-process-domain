@@ -8,11 +8,12 @@
  * committed `dist` in a clean Git install and from node_modules.
  */
 async function main() {
-  const { Broker } = await import(new URL("../dist/internal/broker.js", import.meta.url));
-  const { resolveEndpoint } = await import(new URL("../dist/internal/runtime-path.js", import.meta.url));
-  const endpoint = resolveEndpoint();
-  const broker = new Broker({ endpoint });
-  await broker.start();
+  const { launchBrokerForCurrentUser } = await import(new URL("../dist/internal/broker.js", import.meta.url));
+  const { ELECTION_OWNER_ENV } = await import(new URL("../dist/internal/launcher.js", import.meta.url));
+  const electionOwner = process.env[ELECTION_OWNER_ENV];
+  if (!electionOwner) throw new Error("missing broker election ownership token");
+  delete process.env[ELECTION_OWNER_ENV];
+  await launchBrokerForCurrentUser(electionOwner);
   // Keep this broker process alive. It was spawned detached and unref'ed by
   // the launching client, so it does not hold the parent Pi process alive;
   // within this process the interval is referenced so the broker persists.
