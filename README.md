@@ -101,7 +101,7 @@ npm run check
 npm run test:acceptance
 ```
 
-`npm run check` runs typecheck, lint, build, and unit tests. Acceptance tests launch the actual public `openDomain()` and broker in finite-time subprocess scenarios, then verify a clean packed install/import.
+`npm run check` runs typecheck, lint, rebuilds the committed distribution artifacts, and runs unit tests. Acceptance tests launch the actual public `openDomain()` and broker in finite-time subprocess scenarios, then verify a clean packed install/import. CI rejects every commit whose regenerated `dist/` differs from the committed artifacts.
 
 ## Security notes
 

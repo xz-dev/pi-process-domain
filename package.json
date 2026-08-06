@@ -28,13 +28,13 @@
     "pi-process-domain-broker": "bin/pi-process-domain-broker.mjs"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build:dist": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
     "test:unit": "vitest run test/unit",
     "test:acceptance": "node test/run-acceptance.mjs",
-    "check": "npm run typecheck && npm run lint && npm run build && npm run test:unit && npm run test:acceptance"
+    "check": "npm run typecheck && npm run lint && npm run build:dist && npm run test:unit && npm run test:acceptance"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
