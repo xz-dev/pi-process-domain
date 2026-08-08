@@ -75,8 +75,9 @@ A broker restart creates a new epoch. Old fences never validate. Since v1 has no
 ## Failure model
 
 - Initial open is bounded by `connectTimeoutMs` (default 10 seconds) and resolves only after authenticated lease registration.
-- Reconnect preserves participant ID through a broker-issued resume capability and strictly increasing incarnation.
-- A stale/equal incarnation is rejected; a newer exact incarnation supersedes the old connection.
+- Reconnect normally preserves participant ID through a broker-issued resume capability and strictly increasing incarnation.
+- If an established client's old lease was authoritatively expired, it stays fail-closed/uncertain and re-registers as a fresh participant in the same authenticated domain; runtime lease loss is never emitted as a host-fatal callback.
+- A stale/equal incarnation is rejected; a newer exact incarnation supersedes only the old connection for that participant.
 - Real client heartbeats are broker liveness evidence. Suspect/disconnected leases make the domain uncertain until they resume or expire.
 - Malformed, oversized, or non-canonical wire frames are rejected and the peer is closed.
 - Runtime directories and Unix socket paths are private per-user paths; unsafe/symlinked configured runtime paths fail closed.

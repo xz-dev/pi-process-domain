@@ -20,7 +20,7 @@ try {
   }
   const { domain, created } = await openDomain(options);
 
-  if (command === "hold") {
+  if (command === "hold" || command === "recover") {
     output({ ready: true, created, snapshot: domain.snapshot() });
     const finish = async () => {
       await domain.close();
@@ -28,6 +28,42 @@ try {
     };
     process.on("SIGTERM", () => void finish());
     process.on("SIGINT", () => void finish());
+    if (command === "recover") {
+      if (process.env.TEST_WAIT_FOR_RECOVERY_SIGNAL === "1") {
+        await new Promise((resolve) => process.once("SIGUSR1", resolve));
+      }
+      const originalEpoch = domain.snapshot().brokerEpoch;
+      const until = Date.now() + Number(process.env.TEST_RECOVERY_TIMEOUT_MS ?? 20_000);
+      let recovered = false;
+      let lastError = null;
+      while (Date.now() < until) {
+        const current = domain.snapshot();
+        if (current.certain) {
+          try {
+            const busy = await domain.setActivity("busy");
+            const idle = await domain.setActivity("idle");
+            output({
+              recovered: true,
+              epochChanged: idle.brokerEpoch !== originalEpoch,
+              busy,
+              idle,
+            });
+            recovered = true;
+            break;
+          }
+          catch (error) {
+            lastError = { code: error?.code ?? "UNKNOWN", message: error?.message ?? String(error) };
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      if (!recovered) {
+        output({ recovered: false, snapshot: domain.snapshot(), lastError });
+        process.exitCode = 1;
+      }
+      await domain.close();
+      process.exit();
+    }
     setInterval(() => {}, 60_000);
   }
   else if (command === "reservation") {

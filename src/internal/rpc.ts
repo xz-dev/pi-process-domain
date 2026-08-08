@@ -11,7 +11,11 @@
 import type { Socket } from "node:net";
 import { createBirpc, type BirpcReturn } from "../vendor/birpc/main.js";
 import { FrameDecoder, encodeFrame, type CanonicalObject } from "./framing.js";
-import { ProcessDomainFatalError, type ProcessDomainFatalCode } from "./errors.js";
+import {
+  ProcessDomainFatalError,
+  isProcessDomainFatalError,
+  type ProcessDomainFatalCode,
+} from "./errors.js";
 
 export type LocalFunctions = Record<string, (...args: any[]) => unknown>;
 export type RemoteFunctions = Record<string, (...args: any[]) => unknown>;
@@ -196,8 +200,12 @@ export function createRpcPeer<
     serialize: serializeRpc,
     deserialize: deserializeRpc,
     onGeneralError: (error) => {
-      if (!raw.destroyed) raw.destroy(error);
-      return true;
+      // Remote typed failures are part of the authenticated protocol and must
+      // reach the caller intact. Transport/general failures close the channel
+      // so an established client can reconnect, but also reject the operation;
+      // callers must never receive `undefined` as a false success result.
+      if (!isProcessDomainFatalError(error) && !raw.destroyed) raw.destroy(error);
+      return false;
     },
     proxify: true,
   });

@@ -462,8 +462,12 @@ export class Broker {
         conn.incarnation = incarnationRaw;
         this.recomputeCertain(state);
         this.startHeartbeat(conn, state);
-        this.broadcastSnapshot(state);
-        return { participantId, resumeKey: returnedResumeKey, snapshot: wireSnapshot(state) };
+        const joinedSnapshot = wireSnapshot(state);
+        // Complete the joining RPC before publishing membership to peers. A
+        // synchronous snapshot callback into this same connection can otherwise
+        // race the join response on slow or newly upgraded transports.
+        queueMicrotask(() => this.broadcastSnapshot(state));
+        return { participantId, resumeKey: returnedResumeKey, snapshot: joinedSnapshot };
       },
 
       setActivity: async (args: CanonicalObject): Promise<Record<string, unknown>> => {
@@ -655,8 +659,14 @@ export class Broker {
       }
     };
     conn.heartbeatTimer = setInterval(sweep, DEFAULT_HEARTBEAT_MS);
-    // A slower sweep that also enforces recovery-certainty transitions.
-    conn.sweepTimer = setInterval(() => this.recomputeCertain(state), 1000);
+    // A slower sweep also enforces recovery-certainty transitions. Publish the
+    // snapshot when certainty changes so rejoined clients can leave fail-closed
+    // uncertainty without needing an unrelated domain mutation.
+    conn.sweepTimer = setInterval(() => {
+      const before = state.certain;
+      this.recomputeCertain(state);
+      if (state.certain !== before) this.broadcastSnapshot(state);
+    }, 1000);
   }
 
   private expireParticipant(state: DomainState, participantId: string): void {

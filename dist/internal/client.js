@@ -352,8 +352,12 @@ export class DomainClient {
             const peer = this.peer;
             if (!peer || peer.closed)
                 return;
-            void peer.rpc.$call("heartbeat").catch(() => {
-                /* heartbeat failure handled by reconnect path */
+            void peer.rpc.$call("heartbeat").catch((error) => {
+                // Lease rejection can arrive on an otherwise healthy socket after this
+                // process was paused beyond the broker expiry window. Treat it exactly
+                // like transport loss: become uncertain and re-register, never emit a
+                // host-fatal callback from an established client.
+                this.scheduleReconnect(error instanceof Error ? error : undefined);
             });
         }, DEFAULT_HEARTBEAT_MS);
         if (typeof this.heartbeatTimer === "object" && "unref" in this.heartbeatTimer) {
@@ -385,28 +389,53 @@ export class DomainClient {
     scheduleReconnect(_error) {
         if (this.closed || !this.everJoined)
             return;
-        if (this.reconnectTimer)
+        if (this.reconnectTimer || this.joining)
             return;
         if (this.heartbeatTimer)
             clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = null;
         this.resetTransport();
-        // Broker restart changes epoch; mark uncertain until exact re-registration.
+        // A runtime disconnect or rejected lease is uncertainty, not evidence that
+        // the authenticated host must terminate.
         this.certainToUncertain();
         const delay = 200;
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
-            void this.joinThroughElection(true, true)
-                .catch((err) => {
-                if (!this.closed) {
-                    const fatal = isProcessDomainFatalError(err)
-                        ? err
-                        : new ProcessDomainFatalError("DOMAIN_UNRECOVERABLE", "process domain reconnect failed", err);
-                    this.certainToUncertain();
-                    this.emitFatal(fatal);
-                    void this.close();
-                }
-            });
+            void this.rejoinAfterRuntimeLoss();
         }, delay);
+        if (typeof this.reconnectTimer === "object" && "unref" in this.reconnectTimer) {
+            this.reconnectTimer.unref?.();
+        }
+    }
+    async rejoinAfterRuntimeLoss() {
+        if (this.closed)
+            return;
+        try {
+            await this.joinThroughElection(true, true);
+        }
+        catch (error) {
+            if (this.closed)
+                return;
+            if (isProcessDomainFatalError(error) &&
+                error.code === "LEASE_REJECTED" &&
+                error.message === "unknown resume identity") {
+                // The broker authoritatively expired the old lease (or completed a new
+                // epoch's recovery window before this process resumed). Authentication
+                // still succeeded, so join the same domain as a fresh participant.
+                this.participantId = null;
+                this.resumeKey = "";
+                this.incarnation = 0n;
+                try {
+                    await this.joinThroughElection(true, false);
+                    return;
+                }
+                catch {
+                    // Keep the client uncertain and retry below. Runtime recovery never
+                    // becomes a process-fatal callback.
+                }
+            }
+            this.scheduleReconnect(error instanceof Error ? error : undefined);
+        }
     }
     certainToUncertain() {
         const snap = computeSnapshot({
@@ -427,10 +456,16 @@ export class DomainClient {
     }
     async setActivity(state) {
         const peer = this.requirePeer();
-        const result = (await peer.rpc.$call("setActivity", { activity: state }));
-        const snap = wireToSnapshot(result.snapshot, this.options.declaration.domainId);
-        this.applySnapshot(snap);
-        return snap;
+        try {
+            const result = (await peer.rpc.$call("setActivity", { activity: state }));
+            const snap = wireToSnapshot(result.snapshot, this.options.declaration.domainId);
+            this.applySnapshot(snap);
+            return snap;
+        }
+        catch (error) {
+            this.scheduleReconnect(error instanceof Error ? error : undefined);
+            throw error;
+        }
     }
     async reserveSpawn(options) {
         const peer = this.requirePeer();

@@ -65,6 +65,7 @@ export declare class DomainClient {
     private applySnapshot;
     private flushPendingConfirms;
     private scheduleReconnect;
+    private rejoinAfterRuntimeLoss;
     private certainToUncertain;
     snapshot(): DomainSnapshot;
     setActivity(state: ActivityState): Promise<DomainSnapshot>;

@@ -44,13 +44,16 @@ function start(args = [], options = {}) {
   const child = spawn(process.execPath, [harness, ...args], { env: options.env ?? baseEnv, cwd: root, stdio: ["ignore", "pipe", "pipe"] });
   let stdout = "";
   let stderr = "";
+  let readySettled = false;
   child.stdout.on("data", (chunk) => { stdout += chunk; });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   const ready = new Promise((resolveReady, reject) => {
     const timer = setTimeout(() => reject(new Error(`child readiness timeout\n${stdout}\n${stderr}`)), options.timeout ?? deadlineMs);
     child.stdout.on("data", () => {
+      if (readySettled) return;
       const line = stdout.split("\n").find(Boolean);
       if (line) {
+        readySettled = true;
         clearTimeout(timer);
         resolveReady(JSON.parse(line));
       }
@@ -66,6 +69,27 @@ function start(args = [], options = {}) {
 function parseLast(result) {
   const lines = result.stdout.trim().split("\n").filter(Boolean);
   return JSON.parse(lines.at(-1));
+}
+
+function waitForExit(started, timeout = deadlineMs) {
+  return new Promise((resolveExit, reject) => {
+    const timer = setTimeout(() => {
+      started.child.kill("SIGKILL");
+      const { stdout, stderr } = started.output();
+      reject(new Error(`child exit timeout\n${stdout}\n${stderr}`));
+    }, timeout);
+    started.child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      const { stdout, stderr } = started.output();
+      resolveExit({ code, signal, stdout, stderr });
+    });
+  });
+}
+
+async function terminate(started) {
+  if (started.child.exitCode !== null) return;
+  started.child.kill("SIGTERM");
+  await waitForExit(started).catch(() => {});
 }
 
 async function scenario(name, fn) {
@@ -92,7 +116,24 @@ async function readBrokerPid() {
 }
 
 async function killBroker() {
-  try { process.kill(await readBrokerPid(), "SIGKILL"); } catch { /* already gone */ }
+  let pid = null;
+  try {
+    pid = await readBrokerPid();
+    process.kill(pid, "SIGKILL");
+  }
+  catch { /* already gone */ }
+  if (pid !== null) {
+    const until = Date.now() + deadlineMs;
+    while (Date.now() < until) {
+      try {
+        process.kill(pid, 0);
+        await delay(25);
+      }
+      catch {
+        break;
+      }
+    }
+  }
   await delay(250);
 }
 
@@ -178,6 +219,40 @@ await scenario("reservation adopt cancel replay and expiry fail closed", async (
   await delay(1200);
   const expiredJoin = await run(process.execPath, [harness], { env: { ...baseEnv, ...expiring.env } });
   assert.notEqual(expiredJoin.code, 0);
+});
+
+await scenario("rejected child reservation does not disturb the holding parent", async () => {
+  const made = parseLast(await run(process.execPath, [harness, "reservation"], { env: baseEnv }));
+  const parentEnv = declarationFromReservation(made.env);
+  const parent = start(["hold"], { env: parentEnv });
+  await parent.ready;
+  try {
+    const adopted = await run(process.execPath, [harness], { env: { ...baseEnv, ...made.env } });
+    assert.equal(adopted.code, 0, adopted.stderr);
+    const replay = await run(process.execPath, [harness], { env: { ...baseEnv, ...made.env } });
+    assert.notEqual(replay.code, 0, `replayed claim unexpectedly joined\n${replay.stdout}\n${replay.stderr}`);
+    assert.equal(parent.child.exitCode, null, "replayed child claim must not terminate the holding parent");
+    const observer = await run(process.execPath, [harness], { env: parentEnv });
+    assert.equal(observer.code, 0, observer.stderr);
+  }
+  finally {
+    await terminate(parent);
+  }
+});
+
+await scenario("paused established client recovers after broker lease expiry", async () => {
+  await killBroker();
+  const client = start(["recover"], { env: baseEnv, timeout: 15_000 });
+  await client.ready;
+  process.kill(client.child.pid, "SIGSTOP");
+  await delay(12_500);
+  process.kill(client.child.pid, "SIGCONT");
+  const result = await waitForExit(client, 25_000);
+  assert.equal(result.code, 0, result.stderr);
+  const recovered = parseLast(result);
+  assert.equal(recovered.recovered, true, result.stdout);
+  assert.equal(recovered.idle.certain, true);
+  assert.equal(recovered.idle.allIdle, true);
 });
 
 await scenario("child crash makes the domain uncertain", async () => {
