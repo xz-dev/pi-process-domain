@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile, chmod } from "node:fs/promises";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -15,7 +15,16 @@ const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const harness = join(root, "test/harness/domain-client.mjs");
 const testRuntime = await mkdtemp(join(tmpdir(), "pi-process-domain-runtime-"));
 process.env.XDG_RUNTIME_DIR = testRuntime;
-process.on("exit", () => rmSync(testRuntime, { recursive: true, force: true }));
+process.on("exit", () => {
+  try {
+    const claim = JSON.parse(
+      readFileSync(join(testRuntime, "pi-process-domain", "v1", "election", "election.lock", "claim.json"), "utf8"),
+    );
+    if (Number.isInteger(claim.pid) && claim.pid > 0) process.kill(claim.pid, "SIGTERM");
+  }
+  catch { /* broker absent or already stopped */ }
+  rmSync(testRuntime, { recursive: true, force: true });
+});
 const baseEnv = { ...process.env };
 for (const key of ["PI_PROCESS_DOMAIN_ID", "PI_PROCESS_DOMAIN_KEY", "PI_PROCESS_DOMAIN_PROTOCOL", "PI_PROCESS_DOMAIN_RESERVATION"]) delete baseEnv[key];
 const deadlineMs = 10_000;
