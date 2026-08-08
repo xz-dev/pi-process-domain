@@ -281,7 +281,11 @@ await scenario("broker restart creates a new epoch and fails closed during recov
   const made = parseLast(madeResult);
   const originalBrokerPid = await readBrokerPid();
   const restarted = await run(process.execPath, [harness, "restart"], {
-    env: { ...declarationFromReservation(made.env), TEST_BROKER_CLAIM: brokerClaimPath() },
+    env: {
+      ...declarationFromReservation(made.env),
+      TEST_BROKER_CLAIM: brokerClaimPath(),
+      TEST_RECOVERY_TIMEOUT_MS: "9000",
+    },
     timeout: 15_000,
   });
   assert.equal(restarted.code, 0, restarted.stderr);

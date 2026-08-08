@@ -74,18 +74,26 @@ try {
   }
   else if (command === "restart") {
     const before = domain.snapshot();
+    const observed = [];
+    const unsubscribe = domain.subscribe((snapshot) => observed.push(snapshot));
     const brokerPid = Number(JSON.parse(await readFile(process.env.TEST_BROKER_CLAIM, "utf8")).pid);
     process.kill(brokerPid, "SIGKILL");
-    const until = Date.now() + 9000;
-    while (Date.now() < until && domain.snapshot().brokerEpoch === before.brokerEpoch) {
+    const until = Date.now() + Number(process.env.TEST_RECOVERY_TIMEOUT_MS ?? 9000);
+    while (
+      Date.now() < until &&
+      (domain.snapshot().brokerEpoch === before.brokerEpoch ||
+        (process.env.TEST_WAIT_CERTAIN === "1" && !domain.snapshot().certain))
+    ) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    unsubscribe();
     output({
       created,
       launcherPid: process.pid,
       killedBrokerPid: brokerPid,
       before,
       after: domain.snapshot(),
+      observed,
       confirmedOldFence: await domain.confirm(before.fence),
     });
     await domain.close();
