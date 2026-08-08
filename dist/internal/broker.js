@@ -557,16 +557,17 @@ export class Broker {
             }
             else if (idleMs > SUSPECT_MS) {
                 // Suspected: mark certain=false until a heartbeat resumes it.
-                if (state.certain) {
-                    this.recomputeCertain(state);
+                if (state.certain && this.recomputeCertain(state)) {
                     this.broadcastSnapshot(state);
                 }
             }
         };
         conn.heartbeatTimer = setInterval(sweep, DEFAULT_HEARTBEAT_MS);
-        // A slower sweep also enforces recovery-certainty transitions;
-        // recomputeCertain publishes exactly once when certainty changes.
-        conn.sweepTimer = setInterval(() => this.recomputeCertain(state), 1000);
+        // A slower sweep also enforces recovery-certainty transitions.
+        conn.sweepTimer = setInterval(() => {
+            if (this.recomputeCertain(state))
+                this.broadcastSnapshot(state);
+        }, 1000);
     }
     expireParticipant(state, participantId) {
         const p = state.participants.get(participantId);
@@ -578,6 +579,7 @@ export class Broker {
         this.recomputeCertain(state);
         this.broadcastSnapshot(state);
     }
+    /** Recompute certainty without publishing; true means callers must publish. */
     recomputeCertain(state) {
         let uncertain = false;
         if (state.recoveryDeadline !== null && (Date.now() < state.recoveryDeadline || !state.recoveryParticipantSeen)) {
@@ -599,14 +601,14 @@ export class Broker {
             }
         }
         const next = !uncertain;
-        if (next !== state.certain) {
-            state.certain = next;
-            if (next && state.recoveryDeadline !== null) {
-                // The recovery window has authoritatively expired the unknown set.
-                state.recoveryDeadline = null;
-            }
-            this.broadcastSnapshot(state);
+        if (next === state.certain)
+            return false;
+        state.certain = next;
+        if (next && state.recoveryDeadline !== null) {
+            // The recovery window has authoritatively expired the unknown set.
+            state.recoveryDeadline = null;
         }
+        return true;
     }
     removeParticipant(conn, state) {
         if (conn.participantId) {

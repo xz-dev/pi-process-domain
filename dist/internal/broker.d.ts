@@ -46,6 +46,7 @@ export declare class Broker {
      */
     private startHeartbeat;
     private expireParticipant;
+    /** Recompute certainty without publishing; true means callers must publish. */
     private recomputeCertain;
     private removeParticipant;
     private teardown;

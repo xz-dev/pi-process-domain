@@ -29,10 +29,12 @@ try {
     process.on("SIGTERM", () => void finish());
     process.on("SIGINT", () => void finish());
     if (command === "recover") {
+      const originalEpoch = domain.snapshot().brokerEpoch;
+      const observed = [];
+      const unsubscribe = domain.subscribe((snapshot) => observed.push(snapshot));
       if (process.env.TEST_WAIT_FOR_RECOVERY_SIGNAL === "1") {
         await new Promise((resolve) => process.once("SIGUSR1", resolve));
       }
-      const originalEpoch = domain.snapshot().brokerEpoch;
       const until = Date.now() + Number(process.env.TEST_RECOVERY_TIMEOUT_MS ?? 20_000);
       let recovered = false;
       let lastError = null;
@@ -47,6 +49,7 @@ try {
               epochChanged: idle.brokerEpoch !== originalEpoch,
               busy,
               idle,
+              observed,
             });
             recovered = true;
             break;
@@ -58,13 +61,25 @@ try {
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
       if (!recovered) {
-        output({ recovered: false, snapshot: domain.snapshot(), lastError });
+        output({ recovered: false, snapshot: domain.snapshot(), lastError, observed });
         process.exitCode = 1;
       }
+      unsubscribe();
       await domain.close();
       process.exit();
     }
     setInterval(() => {}, 60_000);
+  }
+  else if (command === "observe") {
+    const observed = [];
+    const unsubscribe = domain.subscribe((snapshot) => observed.push(snapshot));
+    output({ ready: true, created, snapshot: domain.snapshot() });
+    await new Promise((resolve) =>
+      setTimeout(resolve, Number(process.env.TEST_OBSERVE_MS ?? 8000)),
+    );
+    unsubscribe();
+    output({ observed, snapshot: domain.snapshot() });
+    await domain.close();
   }
   else if (command === "reservation") {
     const reservation = await domain.reserveSpawn({ ttlMs: Number(process.env.TEST_TTL_MS ?? 2000) });

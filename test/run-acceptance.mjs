@@ -262,6 +262,47 @@ await scenario("paused established client recovers after broker lease expiry", a
   assert.equal(recovered.recovered, true, result.stdout);
   assert.equal(recovered.idle.certain, true);
   assert.equal(recovered.idle.allIdle, true);
+
+});
+
+await scenario("heartbeat suspicion publishes one uncertainty transition to a peer", async () => {
+  await killBroker();
+  const made = parseLast(await run(process.execPath, [harness, "reservation"], { env: baseEnv }));
+  const declared = declarationFromReservation(made.env);
+  const target = start(["hold"], { env: declared });
+  await target.ready;
+  const observer = start(["observe"], {
+    env: { ...declared, TEST_OBSERVE_MS: "8500" },
+    timeout: 12_000,
+  });
+  await observer.ready;
+  process.kill(target.child.pid, "SIGSTOP");
+  try {
+    const result = await waitForExit(observer, 12_000);
+    assert.equal(result.code, 0, result.stderr);
+    const data = parseLast(result);
+    const firstUncertain = data.observed.findIndex(
+      (snapshot) => snapshot.certain === false,
+    );
+    assert.notEqual(firstUncertain, -1, JSON.stringify(data.observed));
+    const transition = data.observed[firstUncertain];
+    const duplicates = data.observed.filter(
+      (snapshot) =>
+        snapshot.certain === false &&
+        snapshot.brokerEpoch === transition.brokerEpoch &&
+        snapshot.revision === transition.revision &&
+        snapshot.activityGeneration === transition.activityGeneration,
+    );
+    assert.equal(
+      duplicates.length,
+      1,
+      `suspicion transition must publish once: ${JSON.stringify(data.observed)}`,
+    );
+  }
+  finally {
+    process.kill(target.child.pid, "SIGCONT");
+    await terminate(target);
+  }
 });
 
 await scenario("child crash makes the domain uncertain", async () => {
