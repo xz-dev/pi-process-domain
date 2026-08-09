@@ -39,7 +39,60 @@ describe("runtime endpoint derivation (platform-independent)", () => {
     expect(ep.endpointPath).toBe("/run/user/501/pi-process-domain/v1/broker.sock");
   });
 
-  it("windows resolves a deterministic named pipe keyed to the user hash", () => {
+  it("fresh domains derive distinct bounded Unix endpoints", () => {
+    const input = {
+      platform: "linux" as const,
+      uid: 1000,
+      username: "alice",
+      xdg: "/run/user/1000",
+      tmpdir: "/tmp",
+    };
+    const a = resolveEndpointFor(input, { protocolMajor: 2, domainId: "domain-a-123456" });
+    const same = resolveEndpointFor(input, { protocolMajor: 2, domainId: "domain-a-123456" });
+    const b = resolveEndpointFor(input, { protocolMajor: 2, domainId: "domain-b-123456" });
+    expect(a).toEqual(same);
+    expect(a.endpointPath).not.toBe(b.endpointPath);
+    expect(a.endpointPath).toMatch(/\/pi-process-domain\/v1\/d-[0-9a-f]{24}\.sock$/);
+    expect(a.endpointPath).not.toContain("domain-a-123456");
+  });
+
+  it("uses a deterministic private short path when the complete Unix endpoint would be too long", () => {
+    const longXdg = `/tmp/${"long-runtime-component/".repeat(8)}`;
+    const input = {
+      platform: "linux" as const,
+      uid: 1000,
+      username: "alice",
+      xdg: longXdg,
+      tmpdir: "/tmp",
+    };
+    const a = resolveEndpointFor(input, { protocolMajor: 2, domainId: "domain-a-123456" });
+    const same = resolveEndpointFor(input, { protocolMajor: 2, domainId: "domain-a-123456" });
+    const otherBase = resolveEndpointFor({ ...input, xdg: `${longXdg}other` }, {
+      protocolMajor: 2,
+      domainId: "domain-a-123456",
+    });
+
+    expect(a).toEqual(same);
+    expect(a.runtimeDir).toMatch(/^\/tmp\/pi-pd-[0-9a-f]{24}$/);
+    expect(a.endpointPath.length).toBeLessThanOrEqual(100);
+    expect(a.endpointPath).not.toContain(longXdg);
+    expect(a.endpointPath).not.toContain("domain-a-123456");
+    expect(a.endpointPath).not.toBe(otherBase.endpointPath);
+  });
+
+  it("keeps rejecting relative Unix runtime bases instead of falling back around validation", () => {
+    const ep = resolveEndpointFor({
+      platform: "linux",
+      uid: 1000,
+      username: "alice",
+      xdg: "relative/".repeat(20),
+      tmpdir: "/tmp",
+    }, { protocolMajor: 2, domainId: "domain-a-123456" });
+
+    expect(ep.runtimeDir).toMatch(/^relative\//);
+  });
+
+  it("windows resolves a deterministic named pipe keyed to user and fresh domain", () => {
     const ep = resolveEndpointFor({
       platform: "win32",
       username: "dave",
@@ -55,6 +108,19 @@ describe("runtime endpoint derivation (platform-independent)", () => {
     });
     expect(ep.endpointPath).toBe(again.endpointPath);
     expect(ep.endpointPath.startsWith("\\\\.\\pipe\\pi-process-domain-v1-")).toBe(true);
+    const domain = resolveEndpointFor({
+      platform: "win32",
+      username: "dave",
+      tmpdir: "C:\\Users\\dave\\AppData\\Local\\Temp",
+    }, { protocolMajor: 2, domainId: "domain-a-123456" });
+    const otherDomain = resolveEndpointFor({
+      platform: "win32",
+      username: "dave",
+      tmpdir: "C:\\Users\\dave\\AppData\\Local\\Temp",
+    }, { protocolMajor: 2, domainId: "domain-b-123456" });
+    expect(domain.endpointPath).toMatch(/^\\\\\.\\pipe\\pi-process-domain-v2-[0-9a-f]{16}-[0-9a-f]{24}$/);
+    expect(domain.endpointPath).not.toBe(otherDomain.endpointPath);
+    expect(domain.endpointPath.length).toBeLessThan(100);
     // Different users get different pipes.
     const other = resolveEndpointFor({
       platform: "win32",

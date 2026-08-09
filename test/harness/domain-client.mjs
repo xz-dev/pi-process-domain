@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
-import { openDomain } from "../../dist/index.js";
+import { brokerEndpoint, openDomain } from "../../dist/index.js";
 
 const command = process.argv[2] ?? "snapshot";
 const timeoutMs = Number(process.env.TEST_CONNECT_TIMEOUT_MS ?? 4000);
@@ -20,10 +20,51 @@ try {
   }
   const { domain, created } = await openDomain(options);
 
-  if (command === "hold" || command === "recover") {
-    output({ ready: true, created, snapshot: domain.snapshot() });
+  if (command === "root-loss") {
+    const observed = [];
+    const unsubscribe = domain.subscribe((snapshot) => observed.push(snapshot));
+    output({ ready: true, created, endpoint: brokerEndpoint(), snapshot: domain.snapshot() });
+    const triggerFile = process.env.TEST_TRIGGER_FILE;
+    if (!triggerFile) throw new Error("root-loss requires TEST_TRIGGER_FILE");
+    for (;;) {
+      try { await readFile(triggerFile); break; }
+      catch { await new Promise((resolve) => setTimeout(resolve, 25)); }
+    }
+    const until = Date.now() + Number(process.env.TEST_RECOVERY_TIMEOUT_MS ?? 5000);
+    while (domain.snapshot().certain && Date.now() < until) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    let operationError = null;
+    try { await domain.setActivity("busy"); }
+    catch (error) { operationError = error?.code ?? error?.name ?? "Error"; }
+    unsubscribe();
+    output({ snapshot: domain.snapshot(), observed, operationError, endpoint: brokerEndpoint() });
+    await domain.close();
+  }
+  else if (command === "hold" || command === "recover" || command === "hold-reservation" || command === "hold-two") {
+    let reservation = null;
+    if (command === "hold-reservation") {
+      reservation = await domain.reserveSpawn({ ttlMs: Number(process.env.TEST_TTL_MS ?? 2000) });
+      if (process.env.TEST_CANCEL === "1") await reservation.cancel();
+    }
+    const second = command === "hold-two" ? await openDomain(options) : null;
+    output({
+      ready: true,
+      created,
+      secondCreated: second?.created ?? null,
+      endpoint: brokerEndpoint(),
+      env: reservation?.env ?? {
+        PI_PROCESS_DOMAIN_ID: process.env.PI_PROCESS_DOMAIN_ID,
+        PI_PROCESS_DOMAIN_KEY: process.env.PI_PROCESS_DOMAIN_KEY,
+        PI_PROCESS_DOMAIN_PROTOCOL: process.env.PI_PROCESS_DOMAIN_PROTOCOL,
+      },
+      snapshot: domain.snapshot(),
+      secondSnapshot: second?.domain.snapshot() ?? null,
+    });
+    if (second !== null) await domain.close();
     const finish = async () => {
-      await domain.close();
+      if (second !== null) await second.domain.close();
+      else await domain.close();
       process.exit(0);
     };
     process.on("SIGTERM", () => void finish());
@@ -83,7 +124,7 @@ try {
   }
   else if (command === "reservation") {
     const reservation = await domain.reserveSpawn({ ttlMs: Number(process.env.TEST_TTL_MS ?? 2000) });
-    output({ created, env: reservation.env, snapshot: domain.snapshot() });
+    output({ created, endpoint: brokerEndpoint(), env: reservation.env, snapshot: domain.snapshot() });
     if (process.env.TEST_CANCEL === "1") await reservation.cancel();
     await domain.close();
   }
@@ -129,7 +170,7 @@ try {
     await domain.close();
   }
   else {
-    output({ created, snapshot: domain.snapshot() });
+    output({ created, endpoint: brokerEndpoint(), snapshot: domain.snapshot() });
     await domain.close();
   }
 }

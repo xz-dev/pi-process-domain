@@ -14,7 +14,7 @@
  *   - A reservation claim (from env) is presented for exact, single-use adoption.
  */
 import { type DomainDeclaration } from "./declaration.js";
-import { type ActivityState, type DomainFence, type DomainSnapshot } from "./domain-types.js";
+import { type ActivityState, type DomainFence, type DomainSignal, type DomainSnapshot } from "./domain-types.js";
 export interface ClientOptions {
     declaration: DomainDeclaration;
     initialActivity: ActivityState;
@@ -78,7 +78,7 @@ export declare class DomainClient {
     }>;
     subscribe(listener: (snapshot: DomainSnapshot) => void): () => void;
     publish(name: string, value: unknown): Promise<void>;
-    subscribeSignals(name: string, listener: (signal: unknown) => void): () => void;
+    subscribeSignals(name: string, listener: (signal: DomainSignal) => void): () => void;
     private dispatchSignal;
     confirm(fence: DomainFence): Promise<boolean>;
     close(): Promise<void>;

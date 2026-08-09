@@ -26,8 +26,10 @@ export interface DomainDeclaration {
     protocolMinor: number;
 }
 export declare function protocolString(): string;
-/** Create a fresh domain declaration and publish it to process.env. */
-export declare function createDeclaration(): DomainDeclaration;
+/** Create a fresh domain declaration, publishing it unless explicitly deferred. */
+export declare function createDeclaration(publish?: boolean): DomainDeclaration;
+/** Publish a complete declaration only after its root broker and lease are ready. */
+export declare function publishDeclaration(declaration: DomainDeclaration): void;
 export declare function readDeclaration(): DomainDeclaration | null;
 /** Base64url encode a reservation claim for environment transport. */
 export declare function encodeReservationClaim(token: Uint8Array): string;

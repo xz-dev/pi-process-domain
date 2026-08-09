@@ -36,7 +36,7 @@ describe("declaration", () => {
     expect(read).not.toBeNull();
     expect(read!.domainId).toBe(decl.domainId);
     expect(Buffer.from(read!.domainKey).equals(Buffer.from(decl.domainKey))).toBe(true);
-    expect(read!.protocolMajor).toBe(1);
+    expect(read!.protocolMajor).toBe(2);
     expect(read!.protocolMinor).toBe(0);
   });
 
@@ -60,5 +60,12 @@ describe("declaration", () => {
 
     process.env[ENV.PROTOCOL] = "1.999";
     expect(() => readDeclaration()).toThrow(/incompatible/i);
+  });
+
+  it("retains protocol 1.0 only as a legacy declared-session topology", () => {
+    process.env[ENV.DOMAIN_ID] = "legacy-domain-abc";
+    process.env[ENV.DOMAIN_KEY] = base64url(new Uint8Array(32).fill(1));
+    process.env[ENV.PROTOCOL] = "1.0";
+    expect(readDeclaration()?.protocolMajor).toBe(1);
   });
 });

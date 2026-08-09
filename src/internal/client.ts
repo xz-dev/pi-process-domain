@@ -24,8 +24,8 @@ import {
   unbase64url,
 } from "./auth.js";
 import { decodeReservationClaim, type DomainDeclaration } from "./declaration.js";
-import { computeSnapshot, type ActivityState, type DomainFence, type DomainSnapshot } from "./domain-types.js";
-import { PROCESS_DOMAIN_PROTOCOL_MAJOR, PROCESS_DOMAIN_PROTOCOL_MINOR, ProcessDomainFatalError, isProcessDomainFatalError, type ProcessDomainFatalCode } from "./errors.js";
+import { computeSnapshot, type ActivityState, type DomainFence, type DomainSignal, type DomainSnapshot } from "./domain-types.js";
+import { ProcessDomainFatalError, isProcessDomainFatalError, type ProcessDomainFatalCode } from "./errors.js";
 import { type CanonicalObject } from "./framing.js";
 import { RawChannel, createRpcPeer } from "./rpc.js";
 import { resolveEndpoint, type RuntimeEndpoint } from "./runtime-path.js";
@@ -94,7 +94,7 @@ export class DomainClient {
   private incarnation = 0n;
   private lastSnapshot: DomainSnapshot;
   private listeners = new Set<(s: DomainSnapshot) => void>();
-  private signalListeners = new Map<string, Set<(s: unknown) => void>>();
+  private signalListeners = new Map<string, Set<(s: DomainSignal) => void>>();
   private closed = false;
   private fatalEmitted = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -106,7 +106,7 @@ export class DomainClient {
 
   constructor(options: ClientOptions) {
     this.options = options;
-    this.endpoint = resolveEndpoint();
+    this.endpoint = resolveEndpoint(options.declaration);
     this.authKey = deriveDomainAuthKey(options.declaration.domainKey, options.declaration.domainId);
     this.lastSnapshot = computeSnapshot({
       domainId: options.declaration.domainId,
@@ -159,7 +159,8 @@ export class DomainClient {
           this.resetTransport();
           if (isProcessDomainFatalError(err)) throw err;
           const code = (err as NodeJS.ErrnoException).code;
-          if ((code === "ECONNREFUSED" || code === "ENOENT" || code === "EPIPE" || code === "ECONNRESET") && !started) {
+          const unavailable = code === "ECONNREFUSED" || code === "ENOENT" || code === "EPIPE" || code === "ECONNRESET";
+          if (unavailable && create && !started) {
             started = true;
             try {
               await Promise.race([
@@ -168,8 +169,14 @@ export class DomainClient {
               ]);
             }
             catch {
-              /* another contender may have started it; keep retrying */
+              /* another legacy contender may have started it; keep retrying */
             }
+          }
+          if (unavailable && this.options.declaration.protocolMajor !== 1 && !this.everJoined) {
+            // A freshly spawned child can race the root's listen completion;
+            // retry the bounded deadline, but never launch or revive a broker.
+            await this.sleep(Math.max(1, Math.min(100, deadline - Date.now())));
+            continue;
           }
           await this.sleep(Math.max(1, Math.min(100, deadline - Date.now())));
         }
@@ -255,6 +262,7 @@ export class DomainClient {
 
     const challenge = await new Promise<CanonicalObject>((res, rej) => {
       const timer = setTimeout(() => rej(new ProcessDomainFatalError("BROKER_UNAVAILABLE", "handshake timeout")), Math.min(10000, this.options.connectTimeoutMs));
+      timer.unref?.();
       const handler = (frame: CanonicalObject) => {
         if (frame.t === "error") {
           clearTimeout(timer);
@@ -271,7 +279,7 @@ export class DomainClient {
       // Omit optional fields (domainKey only when creating; recover flag).
       const hello: Record<string, unknown> = {
         t: "hello",
-        protocolMajor: PROCESS_DOMAIN_PROTOCOL_MAJOR,
+        protocolMajor: this.options.declaration.protocolMajor,
         protocolMinor: this.options.declaration.protocolMinor,
         domainId,
         create,
@@ -291,8 +299,8 @@ export class DomainClient {
     const brokerMajor = challenge.protocolMajor;
     const brokerMinor = challenge.protocolMinor;
     if (
-      typeof brokerMajor !== "number" || !Number.isInteger(brokerMajor) || brokerMajor !== PROCESS_DOMAIN_PROTOCOL_MAJOR ||
-      typeof brokerMinor !== "number" || !Number.isInteger(brokerMinor) || brokerMinor !== PROCESS_DOMAIN_PROTOCOL_MINOR
+      typeof brokerMajor !== "number" || !Number.isInteger(brokerMajor) || brokerMajor !== this.options.declaration.protocolMajor ||
+      typeof brokerMinor !== "number" || !Number.isInteger(brokerMinor) || brokerMinor !== this.options.declaration.protocolMinor
     ) {
       throw new ProcessDomainFatalError("PROTOCOL_MISMATCH", "broker selected an unsupported protocol version");
     }
@@ -307,6 +315,7 @@ export class DomainClient {
 
     const welcome = await new Promise<CanonicalObject>((res, rej) => {
       const timer = setTimeout(() => rej(new ProcessDomainFatalError("BROKER_UNAVAILABLE", "prove timeout")), Math.min(10000, this.options.connectTimeoutMs));
+      timer.unref?.();
       const handler = (frame: CanonicalObject) => {
         if (frame.t === "error") {
           clearTimeout(timer);
@@ -448,8 +457,9 @@ export class DomainClient {
 
   private async rejoinAfterRuntimeLoss(): Promise<void> {
     if (this.closed) return;
+    const mayCreate = this.options.createDomain === true && this.options.declaration.protocolMajor === 1;
     try {
-      await this.joinThroughElection(true, true);
+      await this.joinThroughElection(mayCreate, mayCreate);
     }
     catch (error) {
       if (this.closed) return;
@@ -465,7 +475,7 @@ export class DomainClient {
         this.resumeKey = "";
         this.incarnation = 0n;
         try {
-          await this.joinThroughElection(true, false);
+          await this.joinThroughElection(mayCreate, false);
           return;
         }
         catch {
@@ -520,7 +530,7 @@ export class DomainClient {
     const env: Record<string, string> = {
       PI_PROCESS_DOMAIN_ID: this.options.declaration.domainId,
       PI_PROCESS_DOMAIN_KEY: Buffer.from(this.options.declaration.domainKey).toString("base64url"),
-      PI_PROCESS_DOMAIN_PROTOCOL: `${PROCESS_DOMAIN_PROTOCOL_MAJOR}.${this.options.declaration.protocolMinor}`,
+      PI_PROCESS_DOMAIN_PROTOCOL: `${this.options.declaration.protocolMajor}.${this.options.declaration.protocolMinor}`,
       PI_PROCESS_DOMAIN_RESERVATION: token,
     };
     const cancel = async () => {
@@ -554,7 +564,7 @@ export class DomainClient {
     await peer.rpc.$call("publish", { name, value: encoded });
   }
 
-  subscribeSignals(name: string, listener: (signal: unknown) => void): () => void {
+  subscribeSignals(name: string, listener: (signal: DomainSignal) => void): () => void {
     let set = this.signalListeners.get(name);
     if (!set) {
       set = new Set();

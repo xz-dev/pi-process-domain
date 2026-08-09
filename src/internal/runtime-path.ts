@@ -1,10 +1,8 @@
 /**
- * Per-user broker endpoint resolution and secure runtime directory.
+ * Secure broker endpoint resolution.
  *
- * - Unix (Linux/macOS/FreeBSD): a private per-UID runtime directory containing
- *   `broker.sock` (Unix pathname socket). Prefer XDG_RUNTIME_DIR when present,
- *   otherwise a private `0700` per-UID directory under os.tmpdir().
- * - Windows: a named pipe `\\.\pipe\pi-process-domain-v1-<user-hash>`.
+ * Protocol 2 endpoints are scoped by a bounded hash of the public domain ID;
+ * protocol 1 retains the historical per-user endpoint for existing sessions.
  *
  * Security: every existing component of the runtime directory is validated with
  * no-follow metadata (must be an absolute path, a real directory, owned by the
@@ -18,6 +16,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { ProcessDomainFatalError } from "./errors.js";
+
+const LEGACY_PROTOCOL_MAJOR = 1;
+// BSD-derived platforms expose the smallest common sockaddr_un path budget.
+const MAX_UNIX_SOCKET_PATH_BYTES = 100;
+
+export interface EndpointIdentity {
+  readonly protocolMajor: number;
+  readonly domainId: string;
+}
 
 export interface RuntimeEndpoint {
   /** Directory holding broker metadata/journal (empty on win32). */
@@ -41,7 +48,7 @@ export interface PlatformInput {
  * all platforms on any host; `resolveEndpoint()` is a thin wrapper feeding the
  * live process values. This function does not touch the filesystem.
  */
-export function resolveEndpointFor(input: PlatformInput): RuntimeEndpoint {
+export function resolveEndpointFor(input: PlatformInput, identity?: EndpointIdentity): RuntimeEndpoint {
   const platform = input.platform;
   const uid = input.uid;
   const user = input.username ?? input.userInfo?.().username ?? "user";
@@ -51,25 +58,37 @@ export function resolveEndpointFor(input: PlatformInput): RuntimeEndpoint {
     : uidMaterial;
   const userMaterial = uid !== undefined && Number.isInteger(uid) ? `uid:${uid}` : `user:${user}`;
   const userHashOut = createHash("sha256").update(userMaterial).digest("hex").slice(0, 16);
+  const legacy = identity === undefined || identity.protocolMajor === LEGACY_PROTOCOL_MAJOR;
+  const domainTag = legacy ? "" : createHash("sha256").update(`domain:${identity.domainId}`).digest("hex").slice(0, 24);
 
   if (platform === "win32") {
     return {
       runtimeDir: "",
-      endpointPath: `\\\\.\\pipe\\pi-process-domain-v1-${userHashOut}`,
+      endpointPath: legacy
+        ? `\\\\.\\pipe\\pi-process-domain-v1-${userHashOut}`
+        : `\\\\.\\pipe\\pi-process-domain-v2-${userHashOut}-${domainTag}`,
       platform: "win32",
     };
   }
 
-  let base: string;
-  if (input.xdg && input.xdg.length > 0) {
-    base = `${input.xdg}/pi-process-domain/v1`;
-  }
-  else {
-    base = `${input.tmpdir}/pi-process-domain/uid-${uidTagOut}`;
+  const configuredBase = input.xdg && input.xdg.length > 0 ? input.xdg : input.tmpdir;
+  let base = input.xdg && input.xdg.length > 0
+    ? `${input.xdg}/pi-process-domain/v1`
+    : `${input.tmpdir}/pi-process-domain/uid-${uidTagOut}`;
+  const socketName = legacy ? "broker.sock" : `d-${domainTag}.sock`;
+  if (!legacy
+    && path.isAbsolute(configuredBase)
+    && Buffer.byteLength(`${base}/${socketName}`) > MAX_UNIX_SOCKET_PATH_BYTES) {
+    const shortTmp = platform === "darwin" ? "/private/tmp" : "/tmp";
+    const runtimeTag = createHash("sha256")
+      .update(`${userMaterial}\0${configuredBase}`)
+      .digest("hex")
+      .slice(0, 24);
+    base = `${shortTmp}/pi-pd-${runtimeTag}`;
   }
   return {
     runtimeDir: base,
-    endpointPath: `${base}/broker.sock`,
+    endpointPath: `${base}/${socketName}`,
     platform: "unix",
   };
 }
@@ -169,7 +188,7 @@ function ensurePrivateDir(base: string, runtimeDir: string): void {
   }
 }
 
-export function resolveEndpoint(): RuntimeEndpoint {
+export function resolveEndpoint(identity?: EndpointIdentity): RuntimeEndpoint {
   const ep = resolveEndpointFor({
     platform: process.platform,
     xdg: process.env.XDG_RUNTIME_DIR,
@@ -177,10 +196,14 @@ export function resolveEndpoint(): RuntimeEndpoint {
     username: os.userInfo?.().username,
     tmpdir: os.tmpdir(),
     userInfo: os.userInfo,
-  });
+  }, identity);
   // Ensure the private runtime directory exists on unix (broker/socket target).
   if (ep.platform === "unix" && ep.runtimeDir.length > 0) {
-    ensurePrivateDir(process.env.XDG_RUNTIME_DIR ?? "", ep.runtimeDir);
+    const xdg = process.env.XDG_RUNTIME_DIR;
+    const usesXdg = xdg !== undefined
+      && (path.resolve(ep.runtimeDir) === path.resolve(xdg)
+        || path.resolve(ep.runtimeDir).startsWith(`${path.resolve(xdg)}${path.sep}`));
+    ensurePrivateDir(usesXdg ? xdg : "", ep.runtimeDir);
   }
   return ep;
 }

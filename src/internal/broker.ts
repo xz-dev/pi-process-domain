@@ -60,7 +60,7 @@ import {
   type ParticipantLease,
   type ReservationLease,
 } from "./broker-state.js";
-import { PROCESS_DOMAIN_PROTOCOL_MAJOR, PROCESS_DOMAIN_PROTOCOL_MINOR, ProcessDomainFatalError } from "./errors.js";
+import { PROCESS_DOMAIN_PROTOCOL_MAJOR, PROCESS_DOMAIN_PROTOCOL_MINOR, ProcessDomainFatalError, isSupportedProtocol } from "./errors.js";
 import { type CanonicalObject } from "./framing.js";
 import { RawChannel, createRpcPeer } from "./rpc.js";
 import { resolveEndpoint, type RuntimeEndpoint } from "./runtime-path.js";
@@ -69,6 +69,8 @@ import { claimElectionForBroker, tryAcquireElection, reclaimStaleElection, relea
 export interface BrokerOptions {
   endpoint: RuntimeEndpoint;
   electionOwner?: string;
+  /** Embedded brokers serve exactly one authenticated domain. */
+  domain?: { readonly domainId: string; readonly domainKey: Uint8Array };
 }
 
 interface Conn {
@@ -120,9 +122,18 @@ export class Broker {
   private conns = new Set<Conn>();
   private server: Server;
   private electionOwner: string | null;
+  private expiryTimers = new Set<ReturnType<typeof setTimeout>>();
+  private listening = false;
+  private closed = false;
 
   constructor(private options: BrokerOptions) {
     this.electionOwner = options.electionOwner ?? null;
+    if (options.domain) {
+      this.domains.set(
+        options.domain.domainId,
+        newDomain(options.domain.domainId, deriveDomainAuthKey(options.domain.domainKey, options.domain.domainId)),
+      );
+    }
     this.server = net.createServer((socket) => this.onConnection(socket));
   }
 
@@ -134,9 +145,17 @@ export class Broker {
     catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === "EADDRINUSE") {
-        // A broker may be listening on this endpoint, or a stale Unix socket may
-        // linger. Probe the endpoint; only if no live broker answers do we
-        // reclaim the stale socket and retry.
+        // Embedded endpoints belong exclusively to their fresh root. Never
+        // unlink an occupied path whose ownership this process cannot prove.
+        if (this.options.domain !== undefined) {
+          throw new ProcessDomainFatalError(
+            "BROKER_UNAVAILABLE",
+            `embedded broker endpoint is already in use: ${ep}`,
+            err,
+          );
+        }
+        // Legacy per-user brokers retain stale-socket recovery after proving no
+        // live broker answers.
         if (this.options.endpoint.platform === "unix") {
           const live = await this.probeEndpoint(ep);
           if (!live) {
@@ -183,15 +202,22 @@ export class Broker {
 
   private listen(ep: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.server.once("error", reject);
+      const onError = (error: Error) => {
+        this.server.removeListener("listening", onListening);
+        reject(error);
+      };
+      const onListening = () => {
+        this.server.removeListener("error", onError);
+        this.listening = true;
+        resolve();
+      };
+      this.server.once("error", onError);
+      this.server.once("listening", onListening);
       // Unix socket: restrictive permissions so other users cannot connect.
       const opts = this.options.endpoint.platform === "unix"
         ? { path: ep, mode: 0o600 }
         : { path: ep };
-      this.server.listen(opts as never, () => {
-        this.server.removeListener("error", reject);
-        resolve();
-      });
+      this.server.listen(opts as never);
     });
   }
 
@@ -238,8 +264,10 @@ export class Broker {
       const major = frame.protocolMajor;
       const minor = frame.protocolMinor;
       if (
-        typeof major !== "number" || !Number.isInteger(major) || major !== PROCESS_DOMAIN_PROTOCOL_MAJOR ||
-        typeof minor !== "number" || !Number.isInteger(minor) || minor !== PROCESS_DOMAIN_PROTOCOL_MINOR
+        typeof major !== "number" || !Number.isInteger(major) ||
+        typeof minor !== "number" || !Number.isInteger(minor) ||
+        !isSupportedProtocol(major, minor) ||
+        (this.options.domain !== undefined && major !== PROCESS_DOMAIN_PROTOCOL_MAJOR)
       ) {
         raw.send({ t: "error", code: "PROTOCOL_MISMATCH" });
         raw.destroy();
@@ -258,6 +286,11 @@ export class Broker {
       }
       let state = this.domains.get(domainId);
       if (!state) {
+        if (this.options.domain !== undefined) {
+          raw.send({ t: "error", code: "DOMAIN_ABSENT" });
+          raw.destroy();
+          return;
+        }
         if (frame.create === true) {
           const keyBytes = unbase64url(typeof frame.domainKey === "string" ? frame.domainKey : "", 32);
           if (!keyBytes) {
@@ -283,7 +316,7 @@ export class Broker {
       conn.brokerNonce = brokerNonce;
       raw.send({
         t: "challenge",
-        protocolMajor: PROCESS_DOMAIN_PROTOCOL_MAJOR,
+        protocolMajor: Number(frame.protocolMajor),
         protocolMinor: PROCESS_DOMAIN_PROTOCOL_MINOR,
         brokerEpoch: state.brokerEpoch,
         brokerNonce: Buffer.from(brokerNonce).toString("base64url"),
@@ -724,10 +757,14 @@ export class Broker {
         this.broadcastSnapshot(state);
         // Expire after the lease if not reconnected.
         const pid = conn.participantId;
-        setTimeout(() => {
+        const expiryTimer = setTimeout(() => {
+          this.expiryTimers.delete(expiryTimer);
+          if (this.closed) return;
           const nowP = state.participants.get(pid);
           if (nowP && !nowP.connected) this.expireParticipant(state, pid);
         }, EXPIRE_MS);
+        this.expiryTimers.add(expiryTimer);
+        expiryTimer.unref?.();
       }
     }
   }
@@ -757,16 +794,24 @@ export class Broker {
   }
 
   async close(): Promise<void> {
-    for (const conn of Array.from(this.conns)) this.teardown(conn);
+    if (this.closed) return;
+    this.closed = true;
+    for (const conn of Array.from(this.conns)) {
+      conn.peer?.close();
+      conn.raw?.destroy();
+      this.teardown(conn);
+    }
     this.conns.clear();
-    await new Promise<void>((resolve) => this.server.close(() => resolve()));
-    if (this.options.endpoint.platform === "unix") {
-      try {
-        fs.unlinkSync(this.options.endpoint.endpointPath);
-      }
-      catch {
-        /* ignore */
-      }
+    for (const timer of this.expiryTimers) clearTimeout(timer);
+    this.expiryTimers.clear();
+    for (const state of this.domains.values()) {
+      for (const reservation of state.reservations.values()) this.clearReservationTimer(reservation);
+      state.reservations.clear();
+    }
+    this.domains.clear();
+    if (this.listening) {
+      this.listening = false;
+      await new Promise<void>((resolve) => this.server.close(() => resolve()));
     }
     if (this.electionOwner !== null) releaseElection(this.electionOwner);
   }

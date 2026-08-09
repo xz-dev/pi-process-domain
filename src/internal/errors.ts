@@ -2,8 +2,15 @@
  * Typed fatal errors for pi-process-domain.
  */
 
-export const PROCESS_DOMAIN_PROTOCOL_MAJOR = 1 as const;
+export const LEGACY_PROCESS_DOMAIN_PROTOCOL_MAJOR = 1 as const;
+export const EMBEDDED_PROCESS_DOMAIN_PROTOCOL_MAJOR = 2 as const;
+export const PROCESS_DOMAIN_PROTOCOL_MAJOR = EMBEDDED_PROCESS_DOMAIN_PROTOCOL_MAJOR;
 export const PROCESS_DOMAIN_PROTOCOL_MINOR = 0 as const;
+
+export function isSupportedProtocol(major: number, minor: number): boolean {
+  return minor === PROCESS_DOMAIN_PROTOCOL_MINOR &&
+    (major === LEGACY_PROCESS_DOMAIN_PROTOCOL_MAJOR || major === EMBEDDED_PROCESS_DOMAIN_PROTOCOL_MAJOR);
+}
 
 export type ProcessDomainFatalCode =
   | "INVALID_DECLARATION"

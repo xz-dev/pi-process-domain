@@ -2,11 +2,9 @@
  * pi-process-domain — public entry point.
  *
  * A small, deep API for authenticated cross-Pi process-domain coordination.
- * One per-user broker is launched lazily on demand; clients authenticate over
- * an HMAC-SHA-256 challenge and share an immutable aggregate snapshot of a
- * domain (exact revisions, activity generation, busy/idle, spawn reservations,
- * and lease/disconnect certainty). This module exposes only the public surface;
- * birpc and the wire protocol are internal implementation details.
+ * Fresh roots host one single-domain broker in-process; inherited descendants
+ * authenticate over that domain's private endpoint. Protocol 1 declarations
+ * retain the legacy shared-client path for already-running sessions only.
  */
 import { ProcessDomainFatalError, isProcessDomainFatalError, FATAL_EXIT_CODE } from "./internal/errors.js";
 import type { ActivityState, DomainFence, DomainSignal, DomainSnapshot, OpenDomainOptions, ProcessDomain, SpawnReservation } from "./internal/domain-types.js";
@@ -37,5 +35,5 @@ export interface OpenDomainResult {
  * than being silently ignored or regenerated.
  */
 export declare function openDomain(options?: Partial<OpenDomainOptions>): Promise<OpenDomainResult>;
-/** Resolve the per-user broker endpoint (path or named pipe) for diagnostics. */
+/** Resolve the current declaration's broker endpoint (legacy when undeclared). */
 export declare function brokerEndpoint(): string;

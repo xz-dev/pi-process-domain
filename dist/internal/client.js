@@ -17,7 +17,7 @@ import * as net from "node:net";
 import { clientMac, deriveDomainAuthKey, macEqual, randomNonce, serverMac, unbase64url, } from "./auth.js";
 import { decodeReservationClaim } from "./declaration.js";
 import { computeSnapshot } from "./domain-types.js";
-import { PROCESS_DOMAIN_PROTOCOL_MAJOR, PROCESS_DOMAIN_PROTOCOL_MINOR, ProcessDomainFatalError, isProcessDomainFatalError } from "./errors.js";
+import { ProcessDomainFatalError, isProcessDomainFatalError } from "./errors.js";
 import {} from "./framing.js";
 import { RawChannel, createRpcPeer } from "./rpc.js";
 import { resolveEndpoint } from "./runtime-path.js";
@@ -78,7 +78,7 @@ export class DomainClient {
     everJoined = false;
     constructor(options) {
         this.options = options;
-        this.endpoint = resolveEndpoint();
+        this.endpoint = resolveEndpoint(options.declaration);
         this.authKey = deriveDomainAuthKey(options.declaration.domainKey, options.declaration.domainId);
         this.lastSnapshot = computeSnapshot({
             domainId: options.declaration.domainId,
@@ -130,7 +130,8 @@ export class DomainClient {
                     if (isProcessDomainFatalError(err))
                         throw err;
                     const code = err.code;
-                    if ((code === "ECONNREFUSED" || code === "ENOENT" || code === "EPIPE" || code === "ECONNRESET") && !started) {
+                    const unavailable = code === "ECONNREFUSED" || code === "ENOENT" || code === "EPIPE" || code === "ECONNRESET";
+                    if (unavailable && create && !started) {
                         started = true;
                         try {
                             await Promise.race([
@@ -139,8 +140,14 @@ export class DomainClient {
                             ]);
                         }
                         catch {
-                            /* another contender may have started it; keep retrying */
+                            /* another legacy contender may have started it; keep retrying */
                         }
+                    }
+                    if (unavailable && this.options.declaration.protocolMajor !== 1 && !this.everJoined) {
+                        // A freshly spawned child can race the root's listen completion;
+                        // retry the bounded deadline, but never launch or revive a broker.
+                        await this.sleep(Math.max(1, Math.min(100, deadline - Date.now())));
+                        continue;
                     }
                     await this.sleep(Math.max(1, Math.min(100, deadline - Date.now())));
                 }
@@ -222,6 +229,7 @@ export class DomainClient {
         const clientNonce = randomNonce();
         const challenge = await new Promise((res, rej) => {
             const timer = setTimeout(() => rej(new ProcessDomainFatalError("BROKER_UNAVAILABLE", "handshake timeout")), Math.min(10000, this.options.connectTimeoutMs));
+            timer.unref?.();
             const handler = (frame) => {
                 if (frame.t === "error") {
                     clearTimeout(timer);
@@ -238,7 +246,7 @@ export class DomainClient {
             // Omit optional fields (domainKey only when creating; recover flag).
             const hello = {
                 t: "hello",
-                protocolMajor: PROCESS_DOMAIN_PROTOCOL_MAJOR,
+                protocolMajor: this.options.declaration.protocolMajor,
                 protocolMinor: this.options.declaration.protocolMinor,
                 domainId,
                 create,
@@ -257,8 +265,8 @@ export class DomainClient {
         const brokerEpoch = typeof challenge.brokerEpoch === "string" ? challenge.brokerEpoch : "";
         const brokerMajor = challenge.protocolMajor;
         const brokerMinor = challenge.protocolMinor;
-        if (typeof brokerMajor !== "number" || !Number.isInteger(brokerMajor) || brokerMajor !== PROCESS_DOMAIN_PROTOCOL_MAJOR ||
-            typeof brokerMinor !== "number" || !Number.isInteger(brokerMinor) || brokerMinor !== PROCESS_DOMAIN_PROTOCOL_MINOR) {
+        if (typeof brokerMajor !== "number" || !Number.isInteger(brokerMajor) || brokerMajor !== this.options.declaration.protocolMajor ||
+            typeof brokerMinor !== "number" || !Number.isInteger(brokerMinor) || brokerMinor !== this.options.declaration.protocolMinor) {
             throw new ProcessDomainFatalError("PROTOCOL_MISMATCH", "broker selected an unsupported protocol version");
         }
         if (!brokerNonceRaw || !brokerEpoch) {
@@ -270,6 +278,7 @@ export class DomainClient {
         const expectedServerMac = serverMac(this.authKey, domainId, clientNonce, brokerNonce, brokerEpoch);
         const welcome = await new Promise((res, rej) => {
             const timer = setTimeout(() => rej(new ProcessDomainFatalError("BROKER_UNAVAILABLE", "prove timeout")), Math.min(10000, this.options.connectTimeoutMs));
+            timer.unref?.();
             const handler = (frame) => {
                 if (frame.t === "error") {
                     clearTimeout(timer);
@@ -410,8 +419,9 @@ export class DomainClient {
     async rejoinAfterRuntimeLoss() {
         if (this.closed)
             return;
+        const mayCreate = this.options.createDomain === true && this.options.declaration.protocolMajor === 1;
         try {
-            await this.joinThroughElection(true, true);
+            await this.joinThroughElection(mayCreate, mayCreate);
         }
         catch (error) {
             if (this.closed)
@@ -426,7 +436,7 @@ export class DomainClient {
                 this.resumeKey = "";
                 this.incarnation = 0n;
                 try {
-                    await this.joinThroughElection(true, false);
+                    await this.joinThroughElection(mayCreate, false);
                     return;
                 }
                 catch {
@@ -477,7 +487,7 @@ export class DomainClient {
         const env = {
             PI_PROCESS_DOMAIN_ID: this.options.declaration.domainId,
             PI_PROCESS_DOMAIN_KEY: Buffer.from(this.options.declaration.domainKey).toString("base64url"),
-            PI_PROCESS_DOMAIN_PROTOCOL: `${PROCESS_DOMAIN_PROTOCOL_MAJOR}.${this.options.declaration.protocolMinor}`,
+            PI_PROCESS_DOMAIN_PROTOCOL: `${this.options.declaration.protocolMajor}.${this.options.declaration.protocolMinor}`,
             PI_PROCESS_DOMAIN_RESERVATION: token,
         };
         const cancel = async () => {

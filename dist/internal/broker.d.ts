@@ -21,6 +21,11 @@ import { type RuntimeEndpoint } from "./runtime-path.js";
 export interface BrokerOptions {
     endpoint: RuntimeEndpoint;
     electionOwner?: string;
+    /** Embedded brokers serve exactly one authenticated domain. */
+    domain?: {
+        readonly domainId: string;
+        readonly domainKey: Uint8Array;
+    };
 }
 export declare class Broker {
     private options;
@@ -28,6 +33,9 @@ export declare class Broker {
     private conns;
     private server;
     private electionOwner;
+    private expiryTimers;
+    private listening;
+    private closed;
     constructor(options: BrokerOptions);
     start(): Promise<void>;
     /** Connect to the endpoint and confirm a live broker answers (or the socket is absent). */

@@ -14,7 +14,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { base64url, unbase64url, AUTH_KEY_BYTES } from "./auth.js";
-import { PROCESS_DOMAIN_PROTOCOL_MAJOR, PROCESS_DOMAIN_PROTOCOL_MINOR, ProcessDomainFatalError } from "./errors.js";
+import { PROCESS_DOMAIN_PROTOCOL_MAJOR, PROCESS_DOMAIN_PROTOCOL_MINOR, ProcessDomainFatalError, isSupportedProtocol } from "./errors.js";
 export const ENV = {
     DOMAIN_ID: "PI_PROCESS_DOMAIN_ID",
     DOMAIN_KEY: "PI_PROCESS_DOMAIN_KEY",
@@ -49,13 +49,13 @@ function parseDeclaration() {
     if (parts.length !== 2 || !Number.isInteger(major) || !Number.isInteger(minor)) {
         throw new ProcessDomainFatalError("INVALID_DECLARATION", "protocol string is malformed");
     }
-    if (major !== PROCESS_DOMAIN_PROTOCOL_MAJOR || minor !== PROCESS_DOMAIN_PROTOCOL_MINOR) {
-        throw new ProcessDomainFatalError("PROTOCOL_MISMATCH", `protocol ${major}.${minor} is incompatible with supported ${protocolString()}`);
+    if (!isSupportedProtocol(major, minor)) {
+        throw new ProcessDomainFatalError("PROTOCOL_MISMATCH", `protocol ${major}.${minor} is incompatible with supported 1.0 or ${protocolString()}`);
     }
     return { domainId: id, domainKey: keyBytes, protocolMajor: major, protocolMinor: minor };
 }
-/** Create a fresh domain declaration and publish it to process.env. */
-export function createDeclaration() {
+/** Create a fresh domain declaration, publishing it unless explicitly deferred. */
+export function createDeclaration(publish = true) {
     const domainId = base64url(randomBytes(16));
     const domainKey = new Uint8Array(randomBytes(AUTH_KEY_BYTES));
     const decl = {
@@ -64,10 +64,15 @@ export function createDeclaration() {
         protocolMajor: PROCESS_DOMAIN_PROTOCOL_MAJOR,
         protocolMinor: PROCESS_DOMAIN_PROTOCOL_MINOR,
     };
-    process.env[ENV.DOMAIN_ID] = domainId;
-    process.env[ENV.DOMAIN_KEY] = base64url(domainKey);
-    process.env[ENV.PROTOCOL] = protocolString();
+    if (publish)
+        publishDeclaration(decl);
     return decl;
+}
+/** Publish a complete declaration only after its root broker and lease are ready. */
+export function publishDeclaration(declaration) {
+    process.env[ENV.DOMAIN_ID] = declaration.domainId;
+    process.env[ENV.DOMAIN_KEY] = base64url(declaration.domainKey);
+    process.env[ENV.PROTOCOL] = `${declaration.protocolMajor}.${declaration.protocolMinor}`;
 }
 export function readDeclaration() {
     return parseDeclaration();

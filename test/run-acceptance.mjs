@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile, chmod } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -8,8 +8,6 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import net from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
-import { brokerEndpoint } from "../dist/index.js";
-import { lockDir } from "../dist/internal/launcher.js";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const harness = join(root, "test/harness/domain-client.mjs");
@@ -30,16 +28,25 @@ for (const key of ["PI_PROCESS_DOMAIN_ID", "PI_PROCESS_DOMAIN_KEY", "PI_PROCESS_
 const deadlineMs = 10_000;
 let passed = 0;
 
+function redact(output) {
+  return output.replace(/("?(?:PI_PROCESS_DOMAIN_KEY|PI_PROCESS_DOMAIN_RESERVATION)"?\s*[:=]\s*")?[A-Za-z0-9_-]{32,}/g, "$1<redacted>");
+}
+
 function run(command, args = [], options = {}) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(command, args, { env: options.env ?? baseEnv, cwd: options.cwd ?? root, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, {
+      env: options.env ?? baseEnv,
+      cwd: options.cwd ?? root,
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: options.shell ?? false,
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      reject(new Error(`timeout: ${command} ${args.join(" ")}\n${stdout}\n${stderr}`));
+      reject(new Error(redact(`timeout: ${command} ${args.join(" ")}\n${stdout}\n${stderr}`)));
     }, options.timeout ?? deadlineMs);
     child.on("error", reject);
     child.on("exit", (code, signal) => {
@@ -57,7 +64,7 @@ function start(args = [], options = {}) {
   child.stdout.on("data", (chunk) => { stdout += chunk; });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   const ready = new Promise((resolveReady, reject) => {
-    const timer = setTimeout(() => reject(new Error(`child readiness timeout\n${stdout}\n${stderr}`)), options.timeout ?? deadlineMs);
+    const timer = setTimeout(() => reject(new Error(redact(`child readiness timeout\n${stdout}\n${stderr}`))), options.timeout ?? deadlineMs);
     child.stdout.on("data", () => {
       if (readySettled) return;
       const line = stdout.split("\n").find(Boolean);
@@ -69,7 +76,7 @@ function start(args = [], options = {}) {
     });
     child.once("exit", (code) => {
       clearTimeout(timer);
-      reject(new Error(`child exited before ready (${code})\n${stdout}\n${stderr}`));
+      reject(new Error(redact(`child exited before ready (${code})\n${stdout}\n${stderr}`)));
     });
   });
   return { child, ready, output: () => ({ stdout, stderr }) };
@@ -85,7 +92,7 @@ function waitForExit(started, timeout = deadlineMs) {
     const timer = setTimeout(() => {
       started.child.kill("SIGKILL");
       const { stdout, stderr } = started.output();
-      reject(new Error(`child exit timeout\n${stdout}\n${stderr}`));
+      reject(new Error(redact(`child exit timeout\n${stdout}\n${stderr}`)));
     }, timeout);
     started.child.once("exit", (code, signal) => {
       clearTimeout(timer);
@@ -107,45 +114,6 @@ async function scenario(name, fn) {
   console.log(`ok ${passed} - ${name}`);
 }
 
-function brokerClaimPath() {
-  return join(lockDir(), "election.lock", "claim.json");
-}
-
-async function readBrokerPid() {
-  const until = Date.now() + deadlineMs;
-  while (Date.now() < until) {
-    try {
-      const claim = JSON.parse(await readFile(brokerClaimPath(), "utf8"));
-      if (Number.isInteger(claim.pid) && claim.pid > 0) return claim.pid;
-    }
-    catch { /* broker has not claimed ownership yet */ }
-    await delay(50);
-  }
-  throw new Error("broker ownership claim did not become ready");
-}
-
-async function killBroker() {
-  let pid = null;
-  try {
-    pid = await readBrokerPid();
-    process.kill(pid, "SIGKILL");
-  }
-  catch { /* already gone */ }
-  if (pid !== null) {
-    const until = Date.now() + deadlineMs;
-    while (Date.now() < until) {
-      try {
-        process.kill(pid, 0);
-        await delay(25);
-      }
-      catch {
-        break;
-      }
-    }
-  }
-  await delay(250);
-}
-
 function declarationFromReservation(env) {
   return {
     ...baseEnv,
@@ -155,14 +123,53 @@ function declarationFromReservation(env) {
   };
 }
 
+await scenario("fresh roots own isolated broker endpoints", async () => {
+  const rootA = start(["hold"], { env: baseEnv });
+  const rootB = start(["hold"], { env: baseEnv });
+  const [a, b] = await Promise.all([rootA.ready, rootB.ready]);
+  try {
+    assert.equal(a.created, true);
+    assert.equal(b.created, true);
+    assert.notEqual(a.endpoint, b.endpoint);
+    await terminate(rootA);
+    assert.equal(rootB.child.exitCode, null, "closing root A must not affect root B");
+  }
+  finally {
+    await terminate(rootA);
+    await terminate(rootB);
+  }
+});
+
+await scenario("repeated opens in one root share ownership until the final close", async () => {
+  const root = start(["hold-two"], { env: baseEnv });
+  const owner = await root.ready;
+  try {
+    assert.equal(owner.created, true);
+    assert.equal(owner.secondCreated, false);
+    assert.equal(owner.snapshot.brokerEpoch, owner.secondSnapshot.brokerEpoch);
+    const joined = await run(process.execPath, [harness], {
+      env: declarationFromReservation(owner.env),
+    });
+    assert.equal(joined.code, 0, joined.stderr);
+    assert.equal(parseLast(joined).endpoint, owner.endpoint);
+  }
+  finally {
+    await terminate(root);
+  }
+});
+
 await scenario("new domain and declared join across processes", async () => {
-  await killBroker();
-  const reservation = await run(process.execPath, [harness, "reservation"], { env: baseEnv });
-  assert.equal(reservation.code, 0);
-  const reservationData = parseLast(reservation);
-  const joined = await run(process.execPath, [harness, "snapshot"], { env: declarationFromReservation(reservationData.env) });
-  assert.equal(joined.code, 0, joined.stderr);
-  assert.equal(parseLast(joined).created, false);
+  const root = start(["hold-reservation"], { env: baseEnv });
+  const reservationData = await root.ready;
+  try {
+    const joined = await run(process.execPath, [harness, "snapshot"], { env: declarationFromReservation(reservationData.env) });
+    assert.equal(joined.code, 0, joined.stderr);
+    assert.equal(parseLast(joined).created, false);
+    assert.equal(parseLast(joined).endpoint, reservationData.endpoint);
+  }
+  finally {
+    await terminate(root);
+  }
 });
 
 await scenario("missing malformed and wrong declared keys fail nonzero", async () => {
@@ -193,11 +200,36 @@ await scenario("missing malformed and wrong declared keys fail nonzero", async (
   assert.equal(minor.code, 78, minor.stderr);
   assert.equal(parseLast(minor).code, "PROTOCOL_MISMATCH");
 
-  const reservationResult = await run(process.execPath, [harness, "reservation"], { env: baseEnv });
-  assert.equal(reservationResult.code, 0, reservationResult.stderr);
-  const reservation = parseLast(reservationResult);
-  const wrong = await run(process.execPath, [harness], { env: { ...declarationFromReservation(reservation.env), PI_PROCESS_DOMAIN_KEY: "A".repeat(43) } });
-  assert.notEqual(wrong.code, 0);
+  const root = start(["hold-reservation"], { env: baseEnv });
+  const reservation = await root.ready;
+  try {
+    const wrongEnv = { ...declarationFromReservation(reservation.env), PI_PROCESS_DOMAIN_KEY: Buffer.alloc(32, 9).toString("base64url"), TEST_FATAL_OVERRIDE: "1" };
+    const wrong = await run(process.execPath, [harness, "caught"], { env: wrongEnv });
+    assert.equal(wrong.code, 78, redact(wrong.stderr));
+    const wrongData = parseLast(wrong);
+    assert.equal(wrongData.code, "AUTHENTICATION_FAILED");
+    assert.equal(wrongData.exitCode, 78);
+    assert.equal(wrongData.overriddenFatal, "AUTHENTICATION_FAILED");
+  }
+  finally {
+    await terminate(root);
+  }
+  const absent = await run(process.execPath, [harness, "caught"], {
+    env: {
+      ...baseEnv,
+      PI_PROCESS_DOMAIN_ID: "absent-domain-123",
+      PI_PROCESS_DOMAIN_KEY: Buffer.alloc(32, 3).toString("base64url"),
+      PI_PROCESS_DOMAIN_PROTOCOL: "2.0",
+      TEST_FATAL_OVERRIDE: "1",
+      TEST_CONNECT_TIMEOUT_MS: "500",
+    },
+    timeout: 3000,
+  });
+  assert.equal(absent.code, 78, redact(absent.stderr));
+  const absentData = parseLast(absent);
+  assert.equal(absentData.code, "BROKER_UNAVAILABLE");
+  assert.equal(absentData.exitCode, 78);
+  assert.equal(absentData.overriddenFatal, "BROKER_UNAVAILABLE");
 });
 
 await scenario("busy idle snapshots, subscription, and fence invalidation", async () => {
@@ -213,33 +245,50 @@ await scenario("busy idle snapshots, subscription, and fence invalidation", asyn
 });
 
 await scenario("reservation adopt cancel replay and expiry fail closed", async () => {
-  const made = parseLast(await run(process.execPath, [harness, "reservation"], { env: { ...baseEnv, TEST_TTL_MS: "1200" } }));
-  assert.equal(made.snapshot.pendingSpawns, 1);
-  const adopted = await run(process.execPath, [harness], { env: { ...baseEnv, ...made.env } });
-  assert.equal(adopted.code, 0, adopted.stderr);
-  const replay = await run(process.execPath, [harness], { env: { ...baseEnv, ...made.env } });
-  assert.notEqual(replay.code, 0);
+  const root = start(["hold-reservation"], { env: { ...baseEnv, TEST_TTL_MS: "1200" } });
+  const made = await root.ready;
+  try {
+    assert.equal(made.snapshot.pendingSpawns, 1);
+    const adopted = await run(process.execPath, [harness], { env: { ...baseEnv, ...made.env } });
+    assert.equal(adopted.code, 0, adopted.stderr);
+    const replay = await run(process.execPath, [harness], { env: { ...baseEnv, ...made.env } });
+    assert.notEqual(replay.code, 0);
+  }
+  finally {
+    await terminate(root);
+  }
 
-  const canceled = parseLast(await run(process.execPath, [harness, "reservation"], { env: { ...baseEnv, TEST_CANCEL: "1" } }));
-  const canceledJoin = await run(process.execPath, [harness], { env: { ...baseEnv, ...canceled.env } });
-  assert.notEqual(canceledJoin.code, 0);
+  const canceledRoot = start(["hold-reservation"], { env: { ...baseEnv, TEST_CANCEL: "1" } });
+  const canceled = await canceledRoot.ready;
+  try {
+    const canceledJoin = await run(process.execPath, [harness], { env: { ...baseEnv, ...canceled.env } });
+    assert.notEqual(canceledJoin.code, 0);
+  }
+  finally {
+    await terminate(canceledRoot);
+  }
 
-  const expiring = parseLast(await run(process.execPath, [harness, "reservation"], { env: { ...baseEnv, TEST_TTL_MS: "1000" } }));
-  await delay(1200);
-  const expiredJoin = await run(process.execPath, [harness], { env: { ...baseEnv, ...expiring.env } });
-  assert.notEqual(expiredJoin.code, 0);
+  const expiringRoot = start(["hold-reservation"], { env: { ...baseEnv, TEST_TTL_MS: "1000" } });
+  const expiring = await expiringRoot.ready;
+  try {
+    await delay(1200);
+    const expiredJoin = await run(process.execPath, [harness], { env: { ...baseEnv, ...expiring.env } });
+    assert.notEqual(expiredJoin.code, 0);
+  }
+  finally {
+    await terminate(expiringRoot);
+  }
 });
 
 await scenario("rejected child reservation does not disturb the holding parent", async () => {
-  const made = parseLast(await run(process.execPath, [harness, "reservation"], { env: baseEnv }));
+  const parent = start(["hold-reservation"], { env: baseEnv });
+  const made = await parent.ready;
   const parentEnv = declarationFromReservation(made.env);
-  const parent = start(["hold"], { env: parentEnv });
-  await parent.ready;
   try {
     const adopted = await run(process.execPath, [harness], { env: { ...baseEnv, ...made.env } });
     assert.equal(adopted.code, 0, adopted.stderr);
     const replay = await run(process.execPath, [harness], { env: { ...baseEnv, ...made.env } });
-    assert.notEqual(replay.code, 0, `replayed claim unexpectedly joined\n${replay.stdout}\n${replay.stderr}`);
+    assert.notEqual(replay.code, 0, redact(`replayed claim unexpectedly joined\n${replay.stdout}\n${replay.stderr}`));
     assert.equal(parent.child.exitCode, null, "replayed child claim must not terminate the holding parent");
     const observer = await run(process.execPath, [harness], { env: parentEnv });
     assert.equal(observer.code, 0, observer.stderr);
@@ -249,30 +298,36 @@ await scenario("rejected child reservation does not disturb the holding parent",
   }
 });
 
-await scenario("paused established client recovers after broker lease expiry", async () => {
-  await killBroker();
-  const client = start(["recover"], { env: baseEnv, timeout: 15_000 });
+if (process.platform !== "win32") await scenario("paused established child recovers after broker lease expiry", async () => {
+  const root = start(["hold"], { env: baseEnv });
+  const owner = await root.ready;
+  const client = start(["recover"], { env: declarationFromReservation(owner.env), timeout: 15_000 });
   await client.ready;
-  process.kill(client.child.pid, "SIGSTOP");
-  await delay(12_500);
-  process.kill(client.child.pid, "SIGCONT");
-  const result = await waitForExit(client, 25_000);
-  assert.equal(result.code, 0, result.stderr);
-  const recovered = parseLast(result);
-  assert.equal(recovered.recovered, true, result.stdout);
-  assert.equal(recovered.idle.certain, true);
-  assert.equal(recovered.idle.allIdle, true);
-
+  try {
+    process.kill(client.child.pid, "SIGSTOP");
+    await delay(12_500);
+    process.kill(client.child.pid, "SIGCONT");
+    const result = await waitForExit(client, 25_000);
+    assert.equal(result.code, 0, result.stderr);
+    const recovered = parseLast(result);
+    assert.equal(recovered.recovered, true, result.stdout);
+    assert.equal(recovered.idle.certain, true);
+    assert.equal(recovered.idle.allIdle, true);
+  }
+  finally {
+    if (client.child.exitCode === null) process.kill(client.child.pid, "SIGCONT");
+    await terminate(client);
+    await terminate(root);
+  }
 });
 
-await scenario("heartbeat suspicion publishes one uncertainty transition to a peer", async () => {
-  await killBroker();
-  const made = parseLast(await run(process.execPath, [harness, "reservation"], { env: baseEnv }));
-  const declared = declarationFromReservation(made.env);
-  const target = start(["hold"], { env: declared });
+if (process.platform !== "win32") await scenario("heartbeat suspicion publishes one uncertainty transition to a peer", async () => {
+  const root = start(["hold"], { env: baseEnv });
+  const owner = await root.ready;
+  const target = start(["hold"], { env: declarationFromReservation(owner.env) });
   await target.ready;
   const observer = start(["observe"], {
-    env: { ...declared, TEST_OBSERVE_MS: "8500" },
+    env: { ...declarationFromReservation(owner.env), TEST_OBSERVE_MS: "8500" },
     timeout: 12_000,
   });
   await observer.ready;
@@ -302,64 +357,127 @@ await scenario("heartbeat suspicion publishes one uncertainty transition to a pe
   finally {
     process.kill(target.child.pid, "SIGCONT");
     await terminate(target);
+    await terminate(observer);
+    await terminate(root);
   }
 });
 
 await scenario("child crash makes the domain uncertain", async () => {
-  const made = parseLast(await run(process.execPath, [harness, "reservation"], { env: baseEnv }));
-  const holder = start(["hold"], { env: declarationFromReservation(made.env) });
+  const root = start(["hold"], { env: baseEnv });
+  const owner = await root.ready;
+  const holder = start(["hold"], { env: declarationFromReservation(owner.env) });
   await holder.ready;
-  holder.child.kill("SIGKILL");
-  await new Promise((r) => holder.child.once("exit", r));
-  const observer = await run(process.execPath, [harness], { env: declarationFromReservation(made.env) });
-  assert.equal(observer.code, 0, observer.stderr);
-  assert.equal(parseLast(observer).snapshot.allIdle, false);
+  try {
+    holder.child.kill("SIGKILL");
+    await new Promise((r) => holder.child.once("exit", r));
+    const observer = await run(process.execPath, [harness], { env: declarationFromReservation(owner.env) });
+    assert.equal(observer.code, 0, observer.stderr);
+    assert.equal(parseLast(observer).snapshot.allIdle, false);
+  }
+  finally {
+    await terminate(holder);
+    await terminate(root);
+  }
 });
 
-await scenario("broker restart creates a new epoch and fails closed during recovery", async () => {
-  const madeResult = await run(process.execPath, [harness, "reservation"], { env: baseEnv });
-  assert.equal(madeResult.code, 0, madeResult.stderr);
-  const made = parseLast(madeResult);
-  const originalBrokerPid = await readBrokerPid();
-  const restarted = await run(process.execPath, [harness, "restart"], {
-    env: {
-      ...declarationFromReservation(made.env),
-      TEST_BROKER_CLAIM: brokerClaimPath(),
-      TEST_RECOVERY_TIMEOUT_MS: "9000",
-    },
-    timeout: 15_000,
+await scenario("legacy v1 declaration joins only a baseline broker", async () => {
+  const work = await mkdtemp(join(tmpdir(), "pi-process-domain-v1-baseline-"));
+  try {
+    const archive = spawn("git", ["archive", "85bb08a"], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+    const tar = spawn("tar", ["-x", "-C", work], { stdio: ["pipe", "ignore", "pipe"] });
+    archive.stdout.pipe(tar.stdin);
+    const [archiveExit, tarExit] = await Promise.all([
+      new Promise((resolveExit) => archive.once("exit", resolveExit)),
+      new Promise((resolveExit) => tar.once("exit", resolveExit)),
+    ]);
+    assert.equal(archiveExit, 0, "baseline archive failed");
+    assert.equal(tarExit, 0, "baseline extraction failed");
+    const install = await run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: work, timeout: 60_000 });
+    assert.equal(install.code, 0, redact(install.stderr));
+    const build = await run("npm", ["run", "build:dist"], { cwd: work, timeout: 30_000 });
+    assert.equal(build.code, 0, redact(build.stderr));
+    const legacyHarness = join(work, "legacy-root.mjs");
+    await writeFile(legacyHarness, `import { openDomain } from "./dist/index.js";\nconst { domain } = await openDomain({ connectTimeoutMs: 4000 });\nprocess.stdout.write(JSON.stringify({ env: { PI_PROCESS_DOMAIN_ID: process.env.PI_PROCESS_DOMAIN_ID, PI_PROCESS_DOMAIN_KEY: process.env.PI_PROCESS_DOMAIN_KEY, PI_PROCESS_DOMAIN_PROTOCOL: process.env.PI_PROCESS_DOMAIN_PROTOCOL } }) + "\\n");\nconst finish = async () => { await domain.close(); process.exit(0); };\nprocess.on("SIGTERM", () => void finish());\nsetInterval(() => {}, 60000);\n`);
+    const legacy = spawn(process.execPath, [legacyHarness], { cwd: work, env: baseEnv, stdio: ["ignore", "pipe", "pipe"] });
+    let legacyOutput = "";
+    let legacyError = "";
+    legacy.stdout.on("data", (chunk) => { legacyOutput += chunk; });
+    legacy.stderr.on("data", (chunk) => { legacyError += chunk; });
+    try {
+      const until = Date.now() + deadlineMs;
+      while (!legacyOutput.includes("\n") && legacy.exitCode === null && Date.now() < until) await delay(25);
+      assert.equal(legacy.exitCode, null, redact(legacyError));
+      const declaration = { ...baseEnv, ...JSON.parse(legacyOutput.trim()).env };
+      const joined = await run(process.execPath, [harness], { env: declaration });
+      assert.equal(joined.code, 0, redact(joined.stderr));
+      assert.equal(parseLast(joined).created, false);
+    }
+    finally {
+      legacy.kill("SIGTERM");
+      await new Promise((resolveExit) => legacy.once("exit", resolveExit));
+    }
+  }
+  finally {
+    await rm(work, { recursive: true, force: true });
+  }
+});
+
+await scenario("established child fails closed after root loss without affecting another root", async () => {
+  const root = start(["hold"], { env: baseEnv });
+  const independent = start(["hold"], { env: baseEnv });
+  const [owner, other] = await Promise.all([root.ready, independent.ready]);
+  const triggerFile = join(testRuntime, `root-loss-${Date.now()}`);
+  const child = start(["root-loss"], {
+    env: { ...declarationFromReservation(owner.env), TEST_RECOVERY_TIMEOUT_MS: "5000", TEST_TRIGGER_FILE: triggerFile },
+    timeout: 10_000,
   });
-  assert.equal(restarted.code, 0, restarted.stderr);
-  const data = parseLast(restarted);
-  assert.equal(data.killedBrokerPid, originalBrokerPid);
-  assert.notEqual(data.launcherPid, originalBrokerPid);
-  assert.notEqual(data.after.brokerEpoch, data.before.brokerEpoch);
-  assert.notEqual(await readBrokerPid(), originalBrokerPid);
-  assert.equal(data.after.certain, false);
-  assert.equal(data.after.allIdle, false);
-  assert.equal(data.confirmedOldFence, false);
+  await child.ready;
+  try {
+    root.child.kill("SIGKILL");
+    await waitForExit(root);
+    await writeFile(triggerFile, "continue\n");
+    const result = await waitForExit(child, 10_000);
+    assert.equal(result.code, 0, redact(result.stderr));
+    const after = parseLast(result);
+    assert.equal(after.snapshot.certain, false);
+    assert.equal(after.snapshot.allIdle, false);
+    assert.equal(after.operationError, "BROKER_UNAVAILABLE");
+    assert.equal(after.endpoint, owner.endpoint);
+    assert.equal(independent.child.exitCode, null, "root loss must not affect an independent domain");
+    assert.notEqual(other.endpoint, owner.endpoint);
+    if (process.platform !== "win32") await assert.rejects(readFile(owner.endpoint), /ENOENT|ENXIO/);
+    const missing = await run(process.execPath, [harness], {
+      env: { ...declarationFromReservation(owner.env), TEST_CONNECT_TIMEOUT_MS: "500" },
+      timeout: 3000,
+    });
+    assert.equal(missing.code, 78, redact(missing.stderr));
+    assert.equal(parseLast(missing).code, "BROKER_UNAVAILABLE");
+  }
+  finally {
+    await terminate(child);
+    await terminate(root);
+    await terminate(independent);
+  }
 });
 
 await scenario("malformed and oversized frames are rejected without killing broker", async () => {
-  const endpoint = brokerEndpoint();
-  for (const payload of [Buffer.from([0, 0, 0, 0]), Buffer.from([0, 1, 0, 1])]) {
-    await new Promise((resolveSocket) => {
-      const socket = net.connect(endpoint, () => socket.end(payload));
-      socket.on("close", resolveSocket);
-      socket.on("error", resolveSocket);
-      setTimeout(() => { socket.destroy(); resolveSocket(); }, 1500);
-    });
+  const root = start(["hold"], { env: baseEnv });
+  const owner = await root.ready;
+  try {
+    for (const payload of [Buffer.from([0, 0, 0, 0]), Buffer.from([0, 1, 0, 1])]) {
+      await new Promise((resolveSocket) => {
+        const socket = net.connect(owner.endpoint, () => socket.end(payload));
+        socket.on("close", resolveSocket);
+        socket.on("error", resolveSocket);
+        setTimeout(() => { socket.destroy(); resolveSocket(); }, 1500);
+      });
+    }
+    const healthy = await run(process.execPath, [harness], { env: declarationFromReservation(owner.env) });
+    assert.equal(healthy.code, 0, healthy.stderr);
   }
-  const healthy = await run(process.execPath, [harness], { env: baseEnv });
-  assert.equal(healthy.code, 0, healthy.stderr);
-});
-
-await scenario("concurrent launch and stale socket recovery", async () => {
-  const endpoint = brokerEndpoint();
-  await killBroker();
-  if (process.platform !== "win32") await writeFile(endpoint, "stale", { mode: 0o600 }).catch(() => {});
-  const results = await Promise.all(Array.from({ length: 8 }, () => run(process.execPath, [harness], { env: baseEnv, timeout: 12_000 })));
-  assert.ok(results.every((item) => item.code === 0), results.map((item) => item.stderr).join("\n"));
+  finally {
+    await terminate(root);
+  }
 });
 
 await scenario("clean packed artifact imports with committed dist", async () => {
@@ -373,12 +491,44 @@ await scenario("clean packed artifact imports with committed dist", async () => 
     await writeFile(join(app, "package.json"), '{"type":"module"}\n');
     const install = await run("npm", ["install", "--ignore-scripts", join(work, tgz)], { cwd: app, timeout: 30_000 });
     assert.equal(install.code, 0, install.stderr);
-    const smoke = await run(process.execPath, ["--input-type=module", "-e", 'import("pi-process-domain").then(m=>console.log(typeof m.openDomain))'], { cwd: app });
-    assert.equal(smoke.code, 0, smoke.stderr);
-    assert.equal(smoke.stdout.trim(), "function");
-    await chmod(join(app, "node_modules/pi-process-domain/bin/pi-process-domain-broker.mjs"), 0o755);
-    const dist = await readFile(join(app, "node_modules/pi-process-domain/dist/index.js"), "utf8");
-    assert.match(dist, /openDomain/);
+    const installedHarness = join(app, "smoke.mjs");
+    await writeFile(installedHarness, `import { openDomain } from "pi-process-domain";\nconst json = (value) => JSON.stringify(value, (_key, item) => typeof item === "bigint" ? item.toString() : item);\nconst { domain, created } = await openDomain({ connectTimeoutMs: 3000 });\nif (process.argv[2] === "hold") {\n  process.stdout.write(json({ created, env: { PI_PROCESS_DOMAIN_ID: process.env.PI_PROCESS_DOMAIN_ID, PI_PROCESS_DOMAIN_KEY: process.env.PI_PROCESS_DOMAIN_KEY, PI_PROCESS_DOMAIN_PROTOCOL: process.env.PI_PROCESS_DOMAIN_PROTOCOL }, snapshot: domain.snapshot() }) + "\\n");\n  const finish = async () => { await domain.close(); process.exit(0); }; process.on("SIGTERM", () => void finish()); setInterval(() => {}, 60000);\n} else { process.stdout.write(json({ created, snapshot: domain.snapshot() }) + "\\n"); await domain.close(); }\n`);
+    const packedRoot = spawn(process.execPath, [installedHarness, "hold"], { cwd: app, env: baseEnv, stdio: ["ignore", "pipe", "pipe"] });
+    let packedOutput = "";
+    let packedError = "";
+    packedRoot.stdout.on("data", (chunk) => { packedOutput += chunk; });
+    packedRoot.stderr.on("data", (chunk) => { packedError += chunk; });
+    try {
+      const until = Date.now() + deadlineMs;
+      while (!packedOutput.includes("\n") && packedRoot.exitCode === null && Date.now() < until) await delay(25);
+      assert.equal(packedRoot.exitCode, null, redact(packedError));
+      const packed = JSON.parse(packedOutput.trim());
+      assert.equal(packed.created, true);
+      assert.equal(packed.snapshot.certain, true);
+      const joined = await run(process.execPath, [installedHarness], { cwd: app, env: { ...baseEnv, ...packed.env } });
+      assert.equal(joined.code, 0, redact(joined.stderr));
+      assert.equal(JSON.parse(joined.stdout).created, false);
+    }
+    finally {
+      if (packedRoot.exitCode === null) {
+        const exited = new Promise((resolveExit) => packedRoot.once("exit", resolveExit));
+        packedRoot.kill("SIGTERM");
+        await exited;
+      }
+    }
+    const bin = join(app, "node_modules/pi-process-domain/bin/pi-process-domain-broker.mjs");
+    const shim = join(app, "node_modules/.bin", process.platform === "win32"
+      ? "pi-process-domain-broker.cmd"
+      : "pi-process-domain-broker");
+    if (process.platform !== "win32") assert.notEqual((await stat(bin)).mode & 0o111, 0);
+    const binSmoke = await run(shim, [], {
+      cwd: app,
+      env: baseEnv,
+      timeout: 3000,
+      shell: process.platform === "win32",
+    });
+    assert.equal(binSmoke.code, 78);
+    assert.match(binSmoke.stderr, /missing broker election ownership token/);
   }
   finally {
     await rm(work, { recursive: true, force: true });
