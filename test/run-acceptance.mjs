@@ -25,6 +25,8 @@ process.on("exit", () => {
 });
 const baseEnv = { ...process.env };
 for (const key of ["PI_PROCESS_DOMAIN_ID", "PI_PROCESS_DOMAIN_KEY", "PI_PROCESS_DOMAIN_PROTOCOL", "PI_PROCESS_DOMAIN_RESERVATION"]) delete baseEnv[key];
+const npmExecPath = process.env.npm_execpath;
+assert.ok(npmExecPath, "acceptance tests must run through npm");
 const deadlineMs = 10_000;
 let passed = 0;
 
@@ -392,9 +394,9 @@ await scenario("legacy v1 declaration joins only a baseline broker", async () =>
     ]);
     assert.equal(archiveExit, 0, "baseline archive failed");
     assert.equal(tarExit, 0, "baseline extraction failed");
-    const install = await run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: work, timeout: 60_000 });
+    const install = await run(process.execPath, [npmExecPath, "install", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: work, timeout: 60_000 });
     assert.equal(install.code, 0, redact(install.stderr));
-    const build = await run("npm", ["run", "build:dist"], { cwd: work, timeout: 30_000 });
+    const build = await run(process.execPath, [npmExecPath, "run", "build:dist"], { cwd: work, timeout: 30_000 });
     assert.equal(build.code, 0, redact(build.stderr));
     const legacyHarness = join(work, "legacy-root.mjs");
     await writeFile(legacyHarness, `import { openDomain } from "./dist/index.js";\nconst { domain } = await openDomain({ connectTimeoutMs: 4000 });\nprocess.stdout.write(JSON.stringify({ env: { PI_PROCESS_DOMAIN_ID: process.env.PI_PROCESS_DOMAIN_ID, PI_PROCESS_DOMAIN_KEY: process.env.PI_PROCESS_DOMAIN_KEY, PI_PROCESS_DOMAIN_PROTOCOL: process.env.PI_PROCESS_DOMAIN_PROTOCOL } }) + "\\n");\nconst finish = async () => { await domain.close(); process.exit(0); };\nprocess.on("SIGTERM", () => void finish());\nsetInterval(() => {}, 60000);\n`);
@@ -483,13 +485,13 @@ await scenario("malformed and oversized frames are rejected without killing brok
 await scenario("clean packed artifact imports with committed dist", async () => {
   const work = await mkdtemp(join(tmpdir(), "pi-process-domain-acceptance-"));
   try {
-    const pack = await run("npm", ["pack", "--silent", "--pack-destination", work], { cwd: root, timeout: 30_000 });
+    const pack = await run(process.execPath, [npmExecPath, "pack", "--silent", "--pack-destination", work], { cwd: root, timeout: 30_000 });
     assert.equal(pack.code, 0, pack.stderr);
     const tgz = pack.stdout.trim().split("\n").at(-1);
     const app = join(work, "app");
     await mkdir(app);
     await writeFile(join(app, "package.json"), '{"type":"module"}\n');
-    const install = await run("npm", ["install", "--ignore-scripts", join(work, tgz)], { cwd: app, timeout: 30_000 });
+    const install = await run(process.execPath, [npmExecPath, "install", "--ignore-scripts", join(work, tgz)], { cwd: app, timeout: 30_000 });
     assert.equal(install.code, 0, install.stderr);
     const installedHarness = join(app, "smoke.mjs");
     await writeFile(installedHarness, `import { openDomain } from "pi-process-domain";\nconst json = (value) => JSON.stringify(value, (_key, item) => typeof item === "bigint" ? item.toString() : item);\nconst { domain, created } = await openDomain({ connectTimeoutMs: 3000 });\nif (process.argv[2] === "hold") {\n  process.stdout.write(json({ created, env: { PI_PROCESS_DOMAIN_ID: process.env.PI_PROCESS_DOMAIN_ID, PI_PROCESS_DOMAIN_KEY: process.env.PI_PROCESS_DOMAIN_KEY, PI_PROCESS_DOMAIN_PROTOCOL: process.env.PI_PROCESS_DOMAIN_PROTOCOL }, snapshot: domain.snapshot() }) + "\\n");\n  const finish = async () => { await domain.close(); process.exit(0); }; process.on("SIGTERM", () => void finish()); setInterval(() => {}, 60000);\n} else { process.stdout.write(json({ created, snapshot: domain.snapshot() }) + "\\n"); await domain.close(); }\n`);
