@@ -2,7 +2,7 @@
 
 Authenticated cross-process coordination for Pi extensions and other Node.js processes that must make exact aggregate-idle decisions.
 
-The package launches one private per-user broker on demand. Processes in a domain authenticate with a 32-byte environment capability, register exact participant leases, publish busy/idle state, reserve child launches before spawning, and confirm immutable idle fences. A snapshot can report `allIdle: true` only while broker membership is certain, at least one participant exists, every participant is idle, and no spawn reservation is pending.
+A fresh root hosts one private single-domain broker inside its own process. Descendants inherit a versioned declaration, authenticate with a 32-byte environment capability, and connect to that root's credential-free endpoint. Each root/domain has an isolated Unix socket or Windows named pipe, so one root's lifecycle cannot restart or disturb another. A snapshot can report `allIdle: true` only while broker membership is certain, at least one participant exists, every participant is idle, and no spawn reservation is pending.
 
 ## Requirements
 
@@ -36,13 +36,17 @@ if (snapshot.allIdle && await domain.confirm(snapshot.fence)) {
 await domain.close();
 ```
 
-The first process with no declaration creates a random domain and writes these variables to its own `process.env` for descendants:
+The first process with no declaration binds and joins an embedded broker, then atomically publishes these variables to its own `process.env` for descendants:
 
 - `PI_PROCESS_DOMAIN_ID`
 - `PI_PROCESS_DOMAIN_KEY`
 - `PI_PROCESS_DOMAIN_PROTOCOL`
 
-Any partial or malformed declaration fails closed. Protocol v1 supports exactly version `1.0`; any other major or minor rejects with `PROTOCOL_MISMATCH`. A declared domain with a wrong key, absent broker state, rejected lease, or incompatible protocol rejects `openDomain()` with `ProcessDomainFatalError`. Initial `openDomain()` failures preserve fail-closed process status by setting `process.exitCode` to `FATAL_EXIT_CODE` (78), even when the rejection is caught. Applications may provide `onFatal` to replace default logging and receive the error, but not to opt out of the initial fail-closed exit status.
+Fresh roots publish protocol `2.0`. Protocol `1.0` is retained only so declarations inherited by already-running legacy sessions can join an already-running detached per-user broker; public `openDomain()` never creates or revives that legacy broker. Any other major or minor rejects with `PROTOCOL_MISMATCH`.
+
+Any partial or malformed declaration fails closed. A declared domain with a wrong key, absent broker state, rejected lease, or incompatible protocol rejects `openDomain()` with `ProcessDomainFatalError`. Initial `openDomain()` failures preserve fail-closed process status by setting `process.exitCode` to `FATAL_EXIT_CODE` (78), even when the rejection is caught. Applications may provide `onFatal` to replace default logging and receive the error, but not to opt out of the initial fail-closed exit status.
+
+`brokerEndpoint()` returns the endpoint selected by the current declaration: a protocol-2 per-domain endpoint for fresh roots/descendants, the historical per-user endpoint for protocol-1 declarations, and the historical endpoint when called before a declaration exists.
 
 ## Reservation-before-spawn
 
@@ -70,17 +74,18 @@ The reservation claim is bound to the domain, expires, is single-use, and is man
 - `allIdle`: never true while `certain` is false.
 - `fence`: `{ brokerEpoch, activityGeneration }` for `domain.confirm(fence)`.
 
-A broker restart creates a new epoch. Old fences never validate. Since v1 has no durable membership journal, recovery deliberately remains uncertain for the lease recovery window and until an authenticated participant resumes; it never guesses that missing participants are idle. Reservations lost with a crashed broker are likewise uncertainty, not proof of idle.
+A broker epoch change invalidates old fences. Protocol-2 embedded brokers are owned by the root process: when that root exits, descendants stay uncertain/fail-closed and never create or revive the endpoint. Protocol-1 compatibility recovery retains the existing conservative behavior: with no durable membership journal it remains uncertain for the lease recovery window and until an authenticated participant resumes; it never guesses that missing participants are idle. Reservations lost with a crashed broker are likewise uncertainty, not proof of idle.
 
 ## Failure model
 
 - Initial open is bounded by `connectTimeoutMs` (default 10 seconds) and resolves only after authenticated lease registration.
 - Reconnect normally preserves participant ID through a broker-issued resume capability and strictly increasing incarnation.
+- A protocol-2 descendant only reconnects to its inherited endpoint. Endpoint loss cannot invoke legacy election or broker spawning.
 - If an established client's old lease was authoritatively expired, it stays fail-closed/uncertain and re-registers as a fresh participant in the same authenticated domain; runtime lease loss is never emitted as a host-fatal callback.
 - A stale/equal incarnation is rejected; a newer exact incarnation supersedes only the old connection for that participant.
 - Real client heartbeats are broker liveness evidence. Suspect/disconnected leases make the domain uncertain until they resume or expire.
 - Malformed, oversized, or non-canonical wire frames are rejected and the peer is closed.
-- Runtime directories and Unix socket paths are private per-user paths; unsafe/symlinked configured runtime paths fail closed.
+- Runtime directories are private per-user paths; protocol-2 socket/pipe names include only bounded hashes of public domain IDs, never keys or reservation tokens. Unsafe/symlinked configured runtime paths fail closed.
 
 ## Signals
 
@@ -102,7 +107,7 @@ npm run check
 npm run test:acceptance
 ```
 
-`npm run check` runs typecheck, lint, rebuilds the committed distribution artifacts, and runs unit tests. Acceptance tests launch the actual public `openDomain()` and broker in finite-time subprocess scenarios, then verify a clean packed install/import. CI rejects every commit whose regenerated `dist/` differs from the committed artifacts.
+`npm run check` runs typecheck, lint, rebuilds the committed distribution artifacts, and runs unit and cross-process acceptance tests. Acceptance launches actual public `openDomain()` roots/descendants, verifies root isolation and fail-closed loss, exercises the explicit legacy compatibility broker, then verifies a clean packed install/import. CI rejects every commit whose regenerated `dist/` differs from the committed artifacts.
 
 ## Security notes
 
