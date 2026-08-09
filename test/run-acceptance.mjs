@@ -399,8 +399,8 @@ await scenario("legacy v1 declaration joins only a baseline broker", async () =>
     const build = await run(process.execPath, [npmExecPath, "run", "build:dist"], { cwd: work, timeout: 30_000 });
     assert.equal(build.code, 0, redact(build.stderr));
     const legacyHarness = join(work, "legacy-root.mjs");
-    await writeFile(legacyHarness, `import { openDomain } from "./dist/index.js";\nconst { domain } = await openDomain({ connectTimeoutMs: 4000 });\nprocess.stdout.write(JSON.stringify({ env: { PI_PROCESS_DOMAIN_ID: process.env.PI_PROCESS_DOMAIN_ID, PI_PROCESS_DOMAIN_KEY: process.env.PI_PROCESS_DOMAIN_KEY, PI_PROCESS_DOMAIN_PROTOCOL: process.env.PI_PROCESS_DOMAIN_PROTOCOL } }) + "\\n");\nconst finish = async () => { await domain.close(); process.exit(0); };\nprocess.on("SIGTERM", () => void finish());\nsetInterval(() => {}, 60000);\n`);
-    const legacy = spawn(process.execPath, [legacyHarness], { cwd: work, env: baseEnv, stdio: ["ignore", "pipe", "pipe"] });
+    await writeFile(legacyHarness, `import { tryAcquireElection } from "./dist/internal/launcher.js";\nimport { launchBrokerForCurrentUser } from "./dist/internal/broker.js";\nimport { openDomain } from "./dist/index.js";\nconst owner = tryAcquireElection();\nif (owner === null) throw new Error("legacy election unavailable");\nconst broker = await launchBrokerForCurrentUser(owner);\nconst { domain } = await openDomain({ connectTimeoutMs: 4000 });\nprocess.stdout.write(JSON.stringify({ env: { PI_PROCESS_DOMAIN_ID: process.env.PI_PROCESS_DOMAIN_ID, PI_PROCESS_DOMAIN_KEY: process.env.PI_PROCESS_DOMAIN_KEY, PI_PROCESS_DOMAIN_PROTOCOL: process.env.PI_PROCESS_DOMAIN_PROTOCOL } }) + "\\n");\nprocess.stdin.once("data", async () => { await domain.close(); await broker.close(); process.exit(0); });\n`);
+    const legacy = spawn(process.execPath, [legacyHarness], { cwd: work, env: baseEnv, stdio: ["pipe", "pipe", "pipe"] });
     let legacyOutput = "";
     let legacyError = "";
     legacy.stdout.on("data", (chunk) => { legacyOutput += chunk; });
@@ -415,8 +415,21 @@ await scenario("legacy v1 declaration joins only a baseline broker", async () =>
       assert.equal(parseLast(joined).created, false);
     }
     finally {
-      legacy.kill("SIGTERM");
-      await new Promise((resolveExit) => legacy.once("exit", resolveExit));
+      const exit = new Promise((resolveExit, reject) => {
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          legacy.kill("SIGKILL");
+        }, deadlineMs);
+        legacy.once("exit", (code, signal) => {
+          clearTimeout(timer);
+          if (timedOut) reject(new Error(redact(`legacy broker close timeout\n${legacyError}`)));
+          else resolveExit({ code, signal });
+        });
+      });
+      legacy.stdin.end("close\n");
+      const result = await exit;
+      assert.equal(result.code, 0, redact(`legacy broker close failed (${result.signal})\n${legacyError}`));
     }
   }
   finally {
