@@ -793,9 +793,13 @@ export class Broker {
     }
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closed) return Promise.resolve();
     this.closed = true;
+    const closed = this.listening
+      ? new Promise<void>((resolve, reject) => this.server.close((error) => error ? reject(error) : resolve()))
+      : Promise.resolve();
+    this.listening = false;
     for (const conn of Array.from(this.conns)) {
       conn.peer?.close();
       conn.raw?.destroy();
@@ -809,11 +813,15 @@ export class Broker {
       state.reservations.clear();
     }
     this.domains.clear();
-    if (this.listening) {
-      this.listening = false;
-      await new Promise<void>((resolve) => this.server.close(() => resolve()));
-    }
     if (this.electionOwner !== null) releaseElection(this.electionOwner);
+    // Bun 1.3.14 can lose this callback after an inherited child disconnects,
+    // even after every accepted socket was destroyed above. Listening already
+    // stopped, so waiting would only hang host shutdown.
+    if (process.versions.bun !== undefined) {
+      void closed.catch(() => {});
+      return Promise.resolve();
+    }
+    return closed;
   }
 }
 

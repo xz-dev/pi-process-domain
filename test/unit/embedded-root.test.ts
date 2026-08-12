@@ -1,5 +1,6 @@
+import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { ENV_NAMES, FATAL_EXIT_CODE, openDomain } from "../../src/index.js";
@@ -39,6 +40,17 @@ describe("embedded root ownership", () => {
     expect(process.env[ENV_NAMES.DOMAIN_ID]).toBe(second.domain.snapshot().domainId);
     await second.domain.close();
   });
+
+  it("closes under Bun after an inherited child leaves", async () => {
+    const bun = process.env.BUN_EXE;
+    if (bun === undefined) return;
+    const child = spawn(bun, [resolve("test/harness/embedded-close.mjs")], { stdio: "ignore" });
+    const status = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+    expect(status).toEqual({ code: 0, signal: null });
+  }, 5_000);
 
   it("opens and closes a fresh root with a long runtime base", async () => {
     clearDeclaration();
