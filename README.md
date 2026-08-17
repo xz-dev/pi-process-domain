@@ -27,6 +27,8 @@ await node.broadcast("work", { kind: "turn-end" });
 
 The root is the only node that binds endpoints. Children only connect to inherited endpoints. The transport does not own counters, retry policies, idle decisions, watchdog thresholds, or durable delivery.
 
+Startup failures are exposed as `ProcessDomainOpenError` with a stable `code`: `INVALID_DECLARATION`, `AUTHENTICATION_FAILED`, or `CONNECTION_UNAVAILABLE`. Consumers should branch only through `isProcessDomainOpenError()` and `code`; the public error message is sanitized and is not a classification contract.
+
 ## XML
 
 `pi-extension-utils/xml` builds and strictly parses one unique trailing XML document, extracts non-thinking assistant text, and neutralizes a finalized assistant message without importing Pi or ZeroMQ.

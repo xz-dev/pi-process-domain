@@ -1,5 +1,6 @@
 import { type OpenProcessDomainOptions, type PiLifecycleExtensionApi, type ProcessDomainNode } from "./types.js";
 export * from "./types.js";
+export { isProcessDomainOpenError, ProcessDomainOpenError, type ProcessDomainOpenErrorCode, } from "./errors.js";
 export { ENV_NAMES } from "./protocol.js";
 export { preferredTransport, wildcardEndpoint } from "./endpoint.js";
 export declare function openProcessDomain(options?: OpenProcessDomainOptions): Promise<ProcessDomainNode>;

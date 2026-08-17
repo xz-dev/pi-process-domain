@@ -1,7 +1,11 @@
 import { Dealer, Router, type Message } from "zeromq";
 import { describe, expect, it } from "vitest";
 import { bindTemporaryEndpoint } from "../src/process-domain/endpoint.js";
-import { ENV_NAMES, openProcessDomain } from "../src/process-domain/index.js";
+import {
+  ENV_NAMES,
+  isProcessDomainOpenError,
+  openProcessDomain,
+} from "../src/process-domain/index.js";
 import {
   createProof,
   decodeDeclaration,
@@ -150,6 +154,42 @@ function ack(socket: Dealer, id: string): Promise<void> {
 }
 
 describe("process-domain authentication and concurrent sends", () => {
+  it("exposes typed and sanitized declaration and connection failures", async () => {
+    const malformed = "not-a-process-domain-declaration";
+    const declarationFailure = await openProcessDomain({
+      env: { [ENV_NAMES.DECLARATION]: malformed },
+      ...timing,
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    if (!isProcessDomainOpenError(declarationFailure)) throw declarationFailure;
+    expect(declarationFailure.code).toBe("INVALID_DECLARATION");
+    expect(declarationFailure.message).not.toContain(malformed);
+
+    const unavailable = {
+      version: PROCESS_DOMAIN_PROTOCOL,
+      domainId: randomId(),
+      endpoint: "tcp://127.0.0.1:1",
+      capability: randomId(32),
+      hostNodeId: randomId(),
+    } as const;
+    const unavailableEncoded = encodeDeclaration(unavailable);
+    const connectionFailure = await openProcessDomain({
+      env: { [ENV_NAMES.DECLARATION]: unavailableEncoded },
+      ...timing,
+      connectTimeoutMs: 100,
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    if (!isProcessDomainOpenError(connectionFailure)) throw connectionFailure;
+    expect(connectionFailure.code).toBe("CONNECTION_UNAVAILABLE");
+    expect(connectionFailure.message).not.toContain(unavailable.endpoint);
+    expect(connectionFailure.message).not.toContain(unavailable.capability);
+    expect(connectionFailure.message).not.toContain(unavailableEncoded);
+  });
+
   it("binds bootstrap responses to the inherited domain and host", async () => {
     const capability = randomId(32);
     const domainId = randomId();
@@ -201,7 +241,15 @@ describe("process-domain authentication and concurrent sends", () => {
       })]);
     })();
     try {
-      await expect(openProcessDomain({ env: { [ENV_NAMES.DECLARATION]: encodeDeclaration(declaration) }, ...timing })).rejects.toThrow("bootstrap authentication failed");
+      const failure = await openProcessDomain({
+        env: { [ENV_NAMES.DECLARATION]: encodeDeclaration(declaration) },
+        ...timing,
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      if (!isProcessDomainOpenError(failure)) throw failure;
+      expect(failure.code).toBe("AUTHENTICATION_FAILED");
       await server;
     } finally {
       bootstrap.close();
@@ -279,8 +327,21 @@ describe("process-domain authentication and concurrent sends", () => {
     const declaration = decodeDeclaration(published);
     if (declaration === null) throw new Error("missing declaration");
     const badDeclaration = { ...declaration, capability: randomId(32) };
+    const encodedBadDeclaration = encodeDeclaration(badDeclaration);
     try {
-      await expect(openProcessDomain({ env: { [ENV_NAMES.DECLARATION]: encodeDeclaration(badDeclaration) }, ...timing, connectTimeoutMs: 100 })).rejects.toThrow("timed out");
+      const failure = await openProcessDomain({
+        env: { [ENV_NAMES.DECLARATION]: encodedBadDeclaration },
+        ...timing,
+        connectTimeoutMs: 100,
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      if (!isProcessDomainOpenError(failure)) throw failure;
+      expect(failure.code).toBe("AUTHENTICATION_FAILED");
+      expect(failure.message).not.toContain(badDeclaration.capability);
+      expect(failure.message).not.toContain(badDeclaration.endpoint);
+      expect(failure.message).not.toContain(encodedBadDeclaration);
       expect(root.peers()).toEqual([]);
       expect(env[ENV_NAMES.DECLARATION]).toBe(published);
     } finally {

@@ -1,6 +1,12 @@
 import { Dealer, Router, type Message } from "zeromq";
 import { bindTemporaryEndpoint } from "./endpoint.js";
 import {
+  authenticationFailedError,
+  connectionUnavailableError,
+  invalidDeclarationError,
+  isProcessDomainOpenError,
+} from "./errors.js";
+import {
   createProof,
   decodeDeclaration,
   decodeEnvelope,
@@ -27,6 +33,11 @@ import {
 } from "./types.js";
 
 export * from "./types.js";
+export {
+  isProcessDomainOpenError,
+  ProcessDomainOpenError,
+  type ProcessDomainOpenErrorCode,
+} from "./errors.js";
 export { ENV_NAMES } from "./protocol.js";
 export { preferredTransport, wildcardEndpoint } from "./endpoint.js";
 
@@ -190,6 +201,7 @@ class DomainRuntime implements ProcessDomainNode {
     const runtime = new DomainRuntime("client", randomId(), declaration, declaration.endpoint.startsWith("ipc://") ? "ipc" : "tcp-loopback", options, metadata);
     const bootstrap = new Dealer({ ...socketOptions(options), routingId: runtime.nodeId });
     let channel: Dealer | null = null;
+    let startupFailure: "connection" | "authentication" = "connection";
     try {
       bootstrap.connect(declaration.endpoint);
     const clientNonce = randomId();
@@ -208,7 +220,7 @@ class DomainRuntime implements ProcessDomainNode {
       challenge.domainId !== declaration.domainId ||
       challenge.nodeId !== runtime.nodeId ||
       challenge.clientNonce !== clientNonce
-    ) throw new Error("process-domain bootstrap challenge failed");
+    ) throw authenticationFailedError(new Error("invalid bootstrap challenge"));
     await runtime.sendOnSocket(bootstrap, {
       version: PROCESS_DOMAIN_PROTOCOL,
       type: "bootstrap",
@@ -225,6 +237,7 @@ class DomainRuntime implements ProcessDomainNode {
         challenge.serverNonce,
       ]),
     }, options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
+    startupFailure = "authentication";
     const response = await runtime.receiveOne(bootstrap, options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
     if (
       response.type !== "bootstrap-ready" ||
@@ -239,7 +252,8 @@ class DomainRuntime implements ProcessDomainNode {
         clientNonce,
         response.serverNonce,
       ], response.proof)
-    ) throw new Error("process-domain bootstrap authentication failed");
+    ) throw authenticationFailedError(new Error("invalid bootstrap response"));
+    startupFailure = "connection";
     bootstrap.close();
     runtime.nodeChannelEndpoint = response.endpoint;
     const nodeChannel = new Dealer({ ...socketOptions(options), routingId: runtime.nodeId });
@@ -263,7 +277,7 @@ class DomainRuntime implements ProcessDomainNode {
         helloClientNonce,
         helloServerNonce,
       ], ready.proof)
-    ) throw new Error("process-domain node channel was rejected");
+    ) throw authenticationFailedError(new Error("invalid node-channel response"));
     runtime.markOnline();
     void runtime.readLoop(nodeChannel, (_identity, envelope) => runtime.handleClientEnvelope(envelope));
     nodeChannel.events.on("handshake", () => {
@@ -277,7 +291,10 @@ class DomainRuntime implements ProcessDomainNode {
       if (!bootstrap.closed) bootstrap.close();
       if (channel !== null && !channel.closed) channel.close();
       runtime.ownSocket = null;
-      throw error;
+      if (isProcessDomainOpenError(error)) throw error;
+      throw startupFailure === "authentication"
+        ? authenticationFailedError(error)
+        : connectionUnavailableError(error);
     }
   }
 
@@ -416,32 +433,48 @@ class DomainRuntime implements ProcessDomainNode {
   private async beginHello(channel: Dealer): Promise<{ readonly ready: WireEnvelope; readonly clientNonce: string; readonly serverNonce: string }> {
     await this.requestHelloChallenge(channel);
     const clientNonce = this.helloClientNonce;
-    if (clientNonce === null) throw new Error("process-domain hello state was lost");
+    if (clientNonce === null) {
+      throw connectionUnavailableError(new Error("hello state was lost"));
+    }
     try {
-      const challenge = await this.receiveOne(channel, this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
+      let challenge: WireEnvelope;
+      try {
+        challenge = await this.receiveOne(channel, this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
+      } catch (error) {
+        throw connectionUnavailableError(error);
+      }
       if (
         challenge.type !== "challenge" ||
         challenge.phase !== "hello" ||
         challenge.domainId !== this.declaration.domainId ||
         challenge.nodeId !== this.nodeId ||
         challenge.clientNonce !== clientNonce
-      ) throw new Error("process-domain hello challenge failed");
+      ) throw authenticationFailedError(new Error("invalid hello challenge"));
       this.helloServerNonce = challenge.serverNonce;
-      await this.sendOnSocket(channel, {
-        version: PROCESS_DOMAIN_PROTOCOL,
-        type: "hello",
-        domainId: this.declaration.domainId,
-        nodeId: this.nodeId,
-        clientNonce,
-        serverNonce: challenge.serverNonce,
-        proof: createProof(this.declaration.capability, "hello", [
-          this.declaration.domainId,
-          this.nodeId,
+      try {
+        await this.sendOnSocket(channel, {
+          version: PROCESS_DOMAIN_PROTOCOL,
+          type: "hello",
+          domainId: this.declaration.domainId,
+          nodeId: this.nodeId,
           clientNonce,
-          challenge.serverNonce,
-        ]),
-      }, this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
-      const ready = await this.receiveOne(channel, this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
+          serverNonce: challenge.serverNonce,
+          proof: createProof(this.declaration.capability, "hello", [
+            this.declaration.domainId,
+            this.nodeId,
+            clientNonce,
+            challenge.serverNonce,
+          ]),
+        }, this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
+      } catch (error) {
+        throw connectionUnavailableError(error);
+      }
+      let ready: WireEnvelope;
+      try {
+        ready = await this.receiveOne(channel, this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
+      } catch (error) {
+        throw authenticationFailedError(error);
+      }
       return { ready, clientNonce, serverNonce: challenge.serverNonce };
     } finally {
       this.clearHelloAttempt();
@@ -890,20 +923,38 @@ class DomainRuntime implements ProcessDomainNode {
 }
 
 export async function openProcessDomain(options: OpenProcessDomainOptions = {}): Promise<ProcessDomainNode> {
+  requireValidOptions(options);
   const env = options.env ?? process.env;
   const metadata = options.metadata ?? {};
   const encoded = env[ENV_NAMES.DECLARATION];
   if (encoded === undefined) {
-    const runtime = await DomainRuntime.host(options, metadata);
+    let runtime: DomainRuntime;
+    try {
+      runtime = await DomainRuntime.host(options, metadata);
+    } catch (error) {
+      throw connectionUnavailableError(error);
+    }
     const declaration = encodeDeclaration(runtime.declaration);
     env[ENV_NAMES.DECLARATION] = declaration;
     runtime.declarationEnv = env;
     runtime.publishedDeclaration = declaration;
     return runtime;
   }
-  const declaration = decodeDeclaration(encoded);
-  if (declaration === null) throw new TypeError("process-domain declaration is missing");
-  return DomainRuntime.client(declaration, options, metadata);
+  let declaration: ProcessDomainDeclaration | null;
+  try {
+    declaration = decodeDeclaration(encoded);
+  } catch (error) {
+    throw invalidDeclarationError(error);
+  }
+  if (declaration === null) {
+    throw invalidDeclarationError(new TypeError("missing declaration"));
+  }
+  try {
+    return await DomainRuntime.client(declaration, options, metadata);
+  } catch (error) {
+    if (isProcessDomainOpenError(error)) throw error;
+    throw connectionUnavailableError(error);
+  }
 }
 
 export function attachPiLifecycle(node: ProcessDomainNode, pi: PiLifecycleExtensionApi, sessionId?: string): { close(): void } {
