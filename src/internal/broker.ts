@@ -34,6 +34,9 @@ import {
   EXPIRE_MS,
   MAX_DOMAIN_ID_LENGTH,
   MAX_INCARNATION,
+  MAX_CYCLE_COUNTERS_PER_DOMAIN,
+  MAX_CYCLE_COUNTER_NAME_LENGTH,
+  MAX_CYCLE_COUNTER_VALUE,
   MAX_METADATA_KEYS,
   MAX_METADATA_KEY_LENGTH,
   MAX_METADATA_VALUE_LENGTH,
@@ -56,12 +59,15 @@ import {
   reservationToken,
   snapshotOf,
   snapshotToWire,
+  cycleCounterSnapshot,
+  type CycleCounterState,
   type DomainState,
   type ParticipantLease,
   type ReservationLease,
 } from "./broker-state.js";
 import { PROCESS_DOMAIN_PROTOCOL_MAJOR, PROCESS_DOMAIN_PROTOCOL_MINOR, ProcessDomainFatalError, isSupportedProtocol } from "./errors.js";
 import { type CanonicalObject } from "./framing.js";
+import type { CycleCounterSnapshot } from "./domain-types.js";
 import { RawChannel, createRpcPeer } from "./rpc.js";
 import { resolveEndpoint, type RuntimeEndpoint } from "./runtime-path.js";
 import { claimElectionForBroker, tryAcquireElection, reclaimStaleElection, releaseElection } from "./launcher.js";
@@ -610,6 +616,72 @@ export class Broker {
         return { ok: true };
       },
 
+      claimCycleCounter: async (args: CanonicalObject): Promise<Record<string, unknown>> => {
+        const p = this.requireParticipant(conn, state);
+        const name = this.counterName(args.name);
+        let counter = state.cycleCounters.get(name);
+        if (!counter) {
+          if (state.cycleCounters.size >= MAX_CYCLE_COUNTERS_PER_DOMAIN)
+            throw new ProcessDomainFatalError("LEASE_REJECTED", "too many cycle counters");
+          counter = { name, value: 0n, paused: false, generation: 1n, ownerParticipantId: p.participantId };
+          state.cycleCounters.set(name, counter);
+        } else if (counter.ownerParticipantId !== null && counter.ownerParticipantId !== p.participantId) {
+          throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter is owned by another participant");
+        } else {
+          counter.ownerParticipantId = p.participantId;
+          counter.generation += 1n;
+        }
+        state.revision += 1n;
+        const snapshot = cycleCounterSnapshot(counter);
+        this.broadcastCycleCounter(state, snapshot);
+        return { counter: this.counterWire(snapshot) };
+      },
+
+      getCycleCounter: async (args: CanonicalObject): Promise<Record<string, unknown>> => {
+        this.requireParticipant(conn, state);
+        const name = this.counterName(args.name);
+        const counter = state.cycleCounters.get(name);
+        if (!counter) return { counter: this.counterWire({ name, value: 0n, paused: false, generation: 0n, ownerParticipantId: null }) };
+        return { counter: this.counterWire(cycleCounterSnapshot(counter)) };
+      },
+
+      incrementCycleCounter: async (args: CanonicalObject): Promise<Record<string, unknown>> => {
+        this.requireParticipant(conn, state);
+        const counter = this.requireCounterGeneration(state, args.name, args.generation);
+        if (counter.ownerParticipantId === null)
+          throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter has no current owner");
+        if (counter.paused) return { counter: this.counterWire(cycleCounterSnapshot(counter)) };
+        const delta = this.counterDelta(args.delta);
+        if (counter.value + delta > MAX_CYCLE_COUNTER_VALUE)
+          throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter exceeds maximum");
+        counter.value += delta;
+        state.revision += 1n;
+        const snapshot = cycleCounterSnapshot(counter);
+        this.broadcastCycleCounter(state, snapshot);
+        return { counter: this.counterWire(snapshot) };
+      },
+
+      resetCycleCounter: async (args: CanonicalObject): Promise<Record<string, unknown>> => {
+        const p = this.requireParticipant(conn, state);
+        const counter = this.requireCounter(state, args.name, p, args.generation);
+        counter.value = 0n;
+        state.revision += 1n;
+        const snapshot = cycleCounterSnapshot(counter);
+        this.broadcastCycleCounter(state, snapshot);
+        return { counter: this.counterWire(snapshot) };
+      },
+
+      setCycleCounterPaused: async (args: CanonicalObject): Promise<Record<string, unknown>> => {
+        const p = this.requireParticipant(conn, state);
+        const counter = this.requireCounter(state, args.name, p, args.generation);
+        if (typeof args.paused !== "boolean") throw new ProcessDomainFatalError("LEASE_REJECTED", "paused must be boolean");
+        counter.paused = args.paused;
+        state.revision += 1n;
+        const snapshot = cycleCounterSnapshot(counter);
+        this.broadcastCycleCounter(state, snapshot);
+        return { counter: this.counterWire(snapshot) };
+      },
+
       publish: async (args: CanonicalObject): Promise<Record<string, unknown>> => {
         const p = this.requireParticipant(conn, state);
         const name = typeof args.name === "string" ? args.name : "";
@@ -636,6 +708,46 @@ export class Broker {
 
     const peer = createRpcPeer(raw, local);
     conn.peer = peer;
+  }
+
+  private counterName(value: unknown): string {
+    if (typeof value !== "string" || value.length === 0 || value.length > MAX_CYCLE_COUNTER_NAME_LENGTH || !/^[A-Za-z0-9_.:-]+$/.test(value))
+      throw new ProcessDomainFatalError("LEASE_REJECTED", "invalid cycle counter name");
+    return value;
+  }
+
+  private counterDelta(value: unknown): bigint {
+    if (value === undefined) return 1n;
+    if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value))
+      throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter delta is malformed");
+    const delta = BigInt(value);
+    if (delta > MAX_CYCLE_COUNTER_VALUE) throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter delta is too large");
+    return delta;
+  }
+
+  private requireCounterGeneration(state: DomainState, nameValue: unknown, generationValue: unknown): CycleCounterState {
+    const name = this.counterName(nameValue);
+    const counter = state.cycleCounters.get(name);
+    if (!counter) throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter does not exist");
+    if (typeof generationValue !== "string" || !/^[1-9][0-9]*$/.test(generationValue) || BigInt(generationValue) !== counter.generation)
+      throw new ProcessDomainFatalError("LEASE_REJECTED", "stale cycle counter generation");
+    return counter;
+  }
+
+  private requireCounter(state: DomainState, nameValue: unknown, participant: ParticipantLease, generationValue: unknown): CycleCounterState {
+    const counter = this.requireCounterGeneration(state, nameValue, generationValue);
+    if (counter.ownerParticipantId !== participant.participantId) throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter owner mismatch");
+    return counter;
+  }
+
+  private counterWire(counter: CycleCounterSnapshot): Record<string, unknown> {
+    return {
+      name: counter.name,
+      value: counter.value.toString(),
+      paused: counter.paused,
+      generation: counter.generation.toString(),
+      ownerParticipantId: counter.ownerParticipantId,
+    };
   }
 
   private clearReservationTimer(res: ReservationLease): void {
@@ -700,6 +812,13 @@ export class Broker {
   private expireParticipant(state: DomainState, participantId: string): void {
     const p = state.participants.get(participantId);
     if (!p) return;
+    for (const counter of state.cycleCounters.values()) {
+      if (counter.ownerParticipantId === participantId) {
+        counter.ownerParticipantId = null;
+        counter.generation += 1n;
+        this.broadcastCycleCounter(state, cycleCounterSnapshot(counter));
+      }
+    }
     state.participants.delete(participantId);
     state.revision += 1n;
     state.activityGeneration += 1n;
@@ -774,6 +893,15 @@ export class Broker {
     for (const conn of this.conns) {
       if (conn.domainState === state && conn.peer && conn.participantId) {
         void conn.peer.rpc.$callEvent("snapshot", snap);
+      }
+    }
+  }
+
+  private broadcastCycleCounter(state: DomainState, counter: CycleCounterSnapshot): void {
+    const payload = this.counterWire(counter);
+    for (const conn of this.conns) {
+      if (conn.domainState === state && conn.peer && conn.participantId) {
+        void conn.peer.rpc.$callEvent("cycleCounter", payload);
       }
     }
   }

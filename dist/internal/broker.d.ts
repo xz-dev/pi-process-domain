@@ -44,6 +44,11 @@ export declare class Broker {
     private onConnection;
     private onHandshake;
     private upgradeToPeer;
+    private counterName;
+    private counterDelta;
+    private requireCounterGeneration;
+    private requireCounter;
+    private counterWire;
     private clearReservationTimer;
     private expireReservation;
     private requireParticipant;
@@ -59,6 +64,7 @@ export declare class Broker {
     private removeParticipant;
     private teardown;
     private broadcastSnapshot;
+    private broadcastCycleCounter;
     private broadcastSignal;
     close(): Promise<void>;
 }

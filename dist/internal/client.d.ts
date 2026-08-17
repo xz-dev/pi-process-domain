@@ -14,7 +14,7 @@
  *   - A reservation claim (from env) is presented for exact, single-use adoption.
  */
 import { type DomainDeclaration } from "./declaration.js";
-import { type ActivityState, type DomainFence, type DomainSignal, type DomainSnapshot } from "./domain-types.js";
+import { type ActivityState, type CycleCounterSnapshot, type DomainFence, type DomainSignal, type DomainSnapshot } from "./domain-types.js";
 export interface ClientOptions {
     declaration: DomainDeclaration;
     initialActivity: ActivityState;
@@ -38,6 +38,7 @@ export declare class DomainClient {
     private lastSnapshot;
     private listeners;
     private signalListeners;
+    private cycleCounterListeners;
     private closed;
     private fatalEmitted;
     private reconnectTimer;
@@ -77,6 +78,13 @@ export declare class DomainClient {
         cancel: () => Promise<void>;
     }>;
     subscribe(listener: (snapshot: DomainSnapshot) => void): () => void;
+    claimCycleCounter(name: string): Promise<CycleCounterSnapshot>;
+    getCycleCounter(name: string): Promise<CycleCounterSnapshot>;
+    subscribeCycleCounter(name: string, listener: (counter: CycleCounterSnapshot) => void): () => void;
+    private dispatchCycleCounter;
+    incrementCycleCounter(name: string, delta?: bigint, generation?: bigint): Promise<CycleCounterSnapshot>;
+    resetCycleCounter(name: string, generation: bigint): Promise<CycleCounterSnapshot>;
+    setCycleCounterPaused(name: string, paused: boolean, generation: bigint): Promise<CycleCounterSnapshot>;
     publish(name: string, value: unknown): Promise<void>;
     subscribeSignals(name: string, listener: (signal: DomainSignal) => void): () => void;
     private dispatchSignal;

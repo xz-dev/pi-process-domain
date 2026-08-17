@@ -102,8 +102,8 @@ export async function openDomain(options) {
             publishDeclaration(root.declaration);
         }
         if (root === undefined)
-            return { domain: client, created };
-        return { domain: ownedDomain(client, host, root), created };
+            return { domain: client, created, hosted: false };
+        return { domain: ownedDomain(client, host, root), created, hosted: true };
     }
     catch (error) {
         const fatal = isProcessDomainFatalError(error)
@@ -131,6 +131,12 @@ function ownedDomain(client, host, root) {
         subscribe: (listener) => client.subscribe(listener),
         publish: (name, value) => client.publish(name, value),
         subscribeSignals: (name, listener) => client.subscribeSignals(name, listener),
+        claimCycleCounter: (name) => client.claimCycleCounter(name),
+        getCycleCounter: (name) => client.getCycleCounter(name),
+        subscribeCycleCounter: (name, listener) => client.subscribeCycleCounter(name, listener),
+        incrementCycleCounter: (name, delta, generation) => client.incrementCycleCounter(name, delta, generation),
+        resetCycleCounter: (name, generation) => client.resetCycleCounter(name, generation),
+        setCycleCounterPaused: (name, paused, generation) => client.setCycleCounterPaused(name, paused, generation),
         confirm: (fence) => client.confirm(fence),
         async close() {
             if (closed)

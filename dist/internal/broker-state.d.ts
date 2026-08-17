@@ -17,7 +17,7 @@
  * Reservations: a spawn reservation binds token + domain + reservationId +
  * expiry + creator participant; adoption is single-use and exact.
  */
-import { type ActivityState, type DomainSnapshot } from "./domain-types.js";
+import { type ActivityState, type CycleCounterSnapshot, type DomainSnapshot } from "./domain-types.js";
 export declare const DEFAULT_HEARTBEAT_MS = 2000;
 export declare const SUSPECT_MS = 6000;
 export declare const EXPIRE_MS = 10000;
@@ -34,6 +34,9 @@ export declare const MAX_METADATA_KEY_LENGTH = 64;
 export declare const MAX_METADATA_VALUE_LENGTH = 4096;
 export declare const MAX_SIGNAL_NAME_LENGTH = 128;
 export declare const MAX_SIGNAL_VALUE_BYTES: number;
+export declare const MAX_CYCLE_COUNTERS_PER_DOMAIN = 64;
+export declare const MAX_CYCLE_COUNTER_NAME_LENGTH = 128;
+export declare const MAX_CYCLE_COUNTER_VALUE = 9223372036854775807n;
 export declare const MAX_PARTICIPANT_ID_LENGTH = 128;
 export declare const MAX_DOMAIN_ID_LENGTH = 128;
 export declare const MIN_INCARNATION = 1n;
@@ -58,6 +61,13 @@ export interface ReservationLease {
     active: boolean;
     timer?: ReturnType<typeof setTimeout>;
 }
+export interface CycleCounterState {
+    name: string;
+    value: bigint;
+    paused: boolean;
+    generation: bigint;
+    ownerParticipantId: string | null;
+}
 export interface DomainState {
     domainId: string;
     domainAuthKey: Uint8Array;
@@ -66,6 +76,7 @@ export interface DomainState {
     activityGeneration: bigint;
     participants: Map<string, ParticipantLease>;
     reservations: Map<string, ReservationLease>;
+    cycleCounters: Map<string, CycleCounterState>;
     /** True when the membership/lease state is authoritatively known. */
     certain: boolean;
     /** When set, certainty may become true only after this timestamp (recovery window). */
@@ -82,6 +93,7 @@ export declare function makeResumeKey(): string;
 export declare function makeReservationId(): string;
 export declare function hashToken(token: Uint8Array): string;
 export declare function reservationToken(): Uint8Array;
+export declare function cycleCounterSnapshot(counter: CycleCounterState): CycleCounterSnapshot;
 export declare function snapshotOf(state: DomainState): DomainSnapshot;
 /** Wire representation of a snapshot (bigint as decimal string). */
 export declare function snapshotToWire(s: DomainSnapshot): Record<string, unknown>;

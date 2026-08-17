@@ -36,6 +36,14 @@ export interface DomainSignal {
   readonly senderId: string;
 }
 
+export interface CycleCounterSnapshot {
+  readonly name: string;
+  readonly value: bigint;
+  readonly paused: boolean;
+  readonly generation: bigint;
+  readonly ownerParticipantId: string | null;
+}
+
 export interface ProcessDomain {
   snapshot(): DomainSnapshot;
   setActivity(state: ActivityState): Promise<DomainSnapshot>;
@@ -43,6 +51,12 @@ export interface ProcessDomain {
   subscribe(listener: (snapshot: DomainSnapshot) => void): () => void;
   publish(name: string, value: unknown): Promise<void>;
   subscribeSignals(name: string, listener: (signal: DomainSignal) => void): () => void;
+  claimCycleCounter(name: string): Promise<CycleCounterSnapshot>;
+  getCycleCounter(name: string): Promise<CycleCounterSnapshot>;
+  subscribeCycleCounter(name: string, listener: (counter: CycleCounterSnapshot) => void): () => void;
+  incrementCycleCounter(name: string, delta?: bigint, generation?: bigint): Promise<CycleCounterSnapshot>;
+  resetCycleCounter(name: string, generation: bigint): Promise<CycleCounterSnapshot>;
+  setCycleCounterPaused(name: string, paused: boolean, generation: bigint): Promise<CycleCounterSnapshot>;
   confirm(fence: DomainFence): Promise<boolean>;
   close(): Promise<void>;
 }

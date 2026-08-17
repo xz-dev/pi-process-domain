@@ -174,6 +174,78 @@ await scenario("new domain and declared join across processes", async () => {
   }
 });
 
+await scenario("named cycle counters are broker-authoritative across processes", async () => {
+  const pauseFile = join(testRuntime, "counter-pause");
+  const resetFile = join(testRuntime, "counter-reset");
+  const owner = start(["counter-owner"], {
+    env: { ...baseEnv, TEST_COUNTER_PAUSE_FILE: pauseFile, TEST_COUNTER_RESET_FILE: resetFile },
+  });
+  const ready = await owner.ready;
+  try {
+    assert.equal(ready.created, true);
+    assert.equal(ready.claimed.value, "0");
+    assert.equal(ready.claimed.generation, "1");
+    const childEnv = { ...declarationFromReservation(ready.env), TEST_CONNECT_TIMEOUT_MS: "10000" };
+    const observed = start(["counter-observe"], { env: childEnv });
+    const observedReady = await observed.ready;
+    assert.equal(observedReady.counter.generation, "1");
+    const increments = await Promise.all(Array.from({ length: 8 }, () => run(process.execPath, [harness, "counter-increment"], {
+      env: { ...childEnv, TEST_COUNTER_GENERATION: "1", TEST_COUNTER_DELTA: "1" },
+      timeout: 30_000,
+    })));
+    for (const result of increments) {
+      assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
+      assert.equal(parseLast(result).counter.generation, "1");
+    }
+    await writeFile(pauseFile, "pause");
+    let ownerLinesAfterPause = [];
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      ownerLinesAfterPause = owner.output().stdout.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      if (ownerLinesAfterPause.at(-1)?.phase === "paused") break;
+      await delay(25);
+    }
+    assert.equal(ownerLinesAfterPause.at(-1)?.phase, "paused", JSON.stringify(ownerLinesAfterPause));
+    const ignored = await run(process.execPath, [harness, "counter-increment"], {
+      env: { ...childEnv, TEST_COUNTER_GENERATION: "1", TEST_COUNTER_DELTA: "3" },
+    });
+    assert.equal(ignored.code, 0, ignored.stderr);
+    assert.equal(parseLast(ignored).counter.value, "8");
+    await writeFile(resetFile, "reset");
+    let ownerLinesAfterReset = [];
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      ownerLinesAfterReset = owner.output().stdout.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      if (ownerLinesAfterReset.at(-1)?.phase === "reset") break;
+      await delay(25);
+    }
+    assert.ok(
+      ownerLinesAfterReset.some((line) => line.phase === "reset"),
+      JSON.stringify(ownerLinesAfterReset),
+    );
+    assert.equal(ownerLinesAfterReset.at(-1)?.phase, "resumed", JSON.stringify(ownerLinesAfterReset));
+    const resumed = await run(process.execPath, [harness, "counter-increment"], {
+      env: { ...childEnv, TEST_COUNTER_GENERATION: "1", TEST_COUNTER_DELTA: "2" },
+    });
+    assert.equal(resumed.code, 0, resumed.stderr);
+    const final = await run(process.execPath, [harness, "counter-increment"], {
+      env: { ...childEnv, TEST_COUNTER_GENERATION: "1", TEST_COUNTER_DELTA: "2" },
+    });
+    assert.equal(final.code, 0, final.stderr);
+    assert.equal(parseLast(final).counter.value, "4");
+    const stale = await run(process.execPath, [harness, "counter-increment"], {
+      env: { ...childEnv, TEST_COUNTER_GENERATION: "2", TEST_COUNTER_DELTA: "1" },
+    });
+    assert.notEqual(stale.code, 0);
+    await delay(250);
+    const observedOutput = observed.output();
+    const last = parseLast({ stdout: observedOutput.stdout });
+    assert.ok(last.observed.length >= 1);
+    await terminate(observed);
+    await terminate(owner);
+  } finally {
+    await terminate(owner);
+  }
+});
+
 await scenario("missing malformed and wrong declared keys fail nonzero", async () => {
   const partial = await run(process.execPath, [harness], { env: { ...baseEnv, PI_PROCESS_DOMAIN_ID: "valid-domain-id" } });
   assert.notEqual(partial.code, 0);

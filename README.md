@@ -87,6 +87,24 @@ A broker epoch change invalidates old fences. Protocol-2 embedded brokers are ow
 - Malformed, oversized, or non-canonical wire frames are rejected and the peer is closed.
 - Runtime directories are private per-user paths; protocol-2 socket/pipe names include only bounded hashes of public domain IDs, never keys or reservation tokens. Unsafe/symlinked configured runtime paths fail closed.
 
+## Named cycle counters
+
+Named cycle counters are broker-owned monotonic values for exact cross-process accounting. One participant claims each name and receives an ownership `generation`; every increment carries that generation and is applied atomically by the broker. Any participant may increment or subscribe while a live owner exists. Only the owner may pause, reset, or resume the counter, and stale generations fail closed. Pause ignores increments, reset preserves the paused state, and subscriber reconnects replay the broker's current snapshot.
+
+```js
+const counter = await domain.claimCycleCounter("plugin.work-cycles");
+const stop = domain.subscribeCycleCounter(counter.name, (next) => {
+  console.log(next.value);
+});
+await domain.incrementCycleCounter(counter.name, 1n, counter.generation);
+await domain.setCycleCounterPaused(counter.name, true, counter.generation);
+await domain.resetCycleCounter(counter.name, counter.generation);
+await domain.setCycleCounterPaused(counter.name, false, counter.generation);
+stop();
+```
+
+Counters survive ordinary client reconnect because broker state and participant identity remain authoritative. The owner is released and its generation advances only when the participant lease expires or leaves; a transport interruption alone does not transfer ownership.
+
 ## Signals
 
 ```js

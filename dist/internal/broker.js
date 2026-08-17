@@ -20,7 +20,7 @@
 import * as net from "node:net";
 import * as fs from "node:fs";
 import { clientMac, deriveDomainAuthKey, macEqual, randomNonce, serverMac, unbase64url, } from "./auth.js";
-import { DEFAULT_HEARTBEAT_MS, EXPIRE_MS, MAX_DOMAIN_ID_LENGTH, MAX_INCARNATION, MAX_METADATA_KEYS, MAX_METADATA_KEY_LENGTH, MAX_METADATA_VALUE_LENGTH, MAX_PARTICIPANT_ID_LENGTH, MAX_PARTICIPANTS_PER_DOMAIN, MAX_RESERVATIONS_PER_DOMAIN, MAX_RESERVATIONS_PER_PARTICIPANT, MAX_SIGNAL_NAME_LENGTH, MAX_SIGNAL_VALUE_BYTES, MIN_INCARNATION, MIN_RESERVATION_TTL_MS, RESERVATION_MAX_TTL_MS, RESERVATION_TTL_MS, SUSPECT_MS, hashToken, makeParticipantId, makeReservationId, makeResumeKey, newDomain, reservationToken, snapshotOf, snapshotToWire, } from "./broker-state.js";
+import { DEFAULT_HEARTBEAT_MS, EXPIRE_MS, MAX_DOMAIN_ID_LENGTH, MAX_INCARNATION, MAX_CYCLE_COUNTERS_PER_DOMAIN, MAX_CYCLE_COUNTER_NAME_LENGTH, MAX_CYCLE_COUNTER_VALUE, MAX_METADATA_KEYS, MAX_METADATA_KEY_LENGTH, MAX_METADATA_VALUE_LENGTH, MAX_PARTICIPANT_ID_LENGTH, MAX_PARTICIPANTS_PER_DOMAIN, MAX_RESERVATIONS_PER_DOMAIN, MAX_RESERVATIONS_PER_PARTICIPANT, MAX_SIGNAL_NAME_LENGTH, MAX_SIGNAL_VALUE_BYTES, MIN_INCARNATION, MIN_RESERVATION_TTL_MS, RESERVATION_MAX_TTL_MS, RESERVATION_TTL_MS, SUSPECT_MS, hashToken, makeParticipantId, makeReservationId, makeResumeKey, newDomain, reservationToken, snapshotOf, snapshotToWire, cycleCounterSnapshot, } from "./broker-state.js";
 import { PROCESS_DOMAIN_PROTOCOL_MAJOR, PROCESS_DOMAIN_PROTOCOL_MINOR, ProcessDomainFatalError, isSupportedProtocol } from "./errors.js";
 import {} from "./framing.js";
 import { RawChannel, createRpcPeer } from "./rpc.js";
@@ -507,6 +507,72 @@ export class Broker {
                 this.removeParticipant(conn, state);
                 return { ok: true };
             },
+            claimCycleCounter: async (args) => {
+                const p = this.requireParticipant(conn, state);
+                const name = this.counterName(args.name);
+                let counter = state.cycleCounters.get(name);
+                if (!counter) {
+                    if (state.cycleCounters.size >= MAX_CYCLE_COUNTERS_PER_DOMAIN)
+                        throw new ProcessDomainFatalError("LEASE_REJECTED", "too many cycle counters");
+                    counter = { name, value: 0n, paused: false, generation: 1n, ownerParticipantId: p.participantId };
+                    state.cycleCounters.set(name, counter);
+                }
+                else if (counter.ownerParticipantId !== null && counter.ownerParticipantId !== p.participantId) {
+                    throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter is owned by another participant");
+                }
+                else {
+                    counter.ownerParticipantId = p.participantId;
+                    counter.generation += 1n;
+                }
+                state.revision += 1n;
+                const snapshot = cycleCounterSnapshot(counter);
+                this.broadcastCycleCounter(state, snapshot);
+                return { counter: this.counterWire(snapshot) };
+            },
+            getCycleCounter: async (args) => {
+                this.requireParticipant(conn, state);
+                const name = this.counterName(args.name);
+                const counter = state.cycleCounters.get(name);
+                if (!counter)
+                    return { counter: this.counterWire({ name, value: 0n, paused: false, generation: 0n, ownerParticipantId: null }) };
+                return { counter: this.counterWire(cycleCounterSnapshot(counter)) };
+            },
+            incrementCycleCounter: async (args) => {
+                this.requireParticipant(conn, state);
+                const counter = this.requireCounterGeneration(state, args.name, args.generation);
+                if (counter.ownerParticipantId === null)
+                    throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter has no current owner");
+                if (counter.paused)
+                    return { counter: this.counterWire(cycleCounterSnapshot(counter)) };
+                const delta = this.counterDelta(args.delta);
+                if (counter.value + delta > MAX_CYCLE_COUNTER_VALUE)
+                    throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter exceeds maximum");
+                counter.value += delta;
+                state.revision += 1n;
+                const snapshot = cycleCounterSnapshot(counter);
+                this.broadcastCycleCounter(state, snapshot);
+                return { counter: this.counterWire(snapshot) };
+            },
+            resetCycleCounter: async (args) => {
+                const p = this.requireParticipant(conn, state);
+                const counter = this.requireCounter(state, args.name, p, args.generation);
+                counter.value = 0n;
+                state.revision += 1n;
+                const snapshot = cycleCounterSnapshot(counter);
+                this.broadcastCycleCounter(state, snapshot);
+                return { counter: this.counterWire(snapshot) };
+            },
+            setCycleCounterPaused: async (args) => {
+                const p = this.requireParticipant(conn, state);
+                const counter = this.requireCounter(state, args.name, p, args.generation);
+                if (typeof args.paused !== "boolean")
+                    throw new ProcessDomainFatalError("LEASE_REJECTED", "paused must be boolean");
+                counter.paused = args.paused;
+                state.revision += 1n;
+                const snapshot = cycleCounterSnapshot(counter);
+                this.broadcastCycleCounter(state, snapshot);
+                return { counter: this.counterWire(snapshot) };
+            },
             publish: async (args) => {
                 const p = this.requireParticipant(conn, state);
                 const name = typeof args.name === "string" ? args.name : "";
@@ -532,6 +598,45 @@ export class Broker {
         };
         const peer = createRpcPeer(raw, local);
         conn.peer = peer;
+    }
+    counterName(value) {
+        if (typeof value !== "string" || value.length === 0 || value.length > MAX_CYCLE_COUNTER_NAME_LENGTH || !/^[A-Za-z0-9_.:-]+$/.test(value))
+            throw new ProcessDomainFatalError("LEASE_REJECTED", "invalid cycle counter name");
+        return value;
+    }
+    counterDelta(value) {
+        if (value === undefined)
+            return 1n;
+        if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value))
+            throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter delta is malformed");
+        const delta = BigInt(value);
+        if (delta > MAX_CYCLE_COUNTER_VALUE)
+            throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter delta is too large");
+        return delta;
+    }
+    requireCounterGeneration(state, nameValue, generationValue) {
+        const name = this.counterName(nameValue);
+        const counter = state.cycleCounters.get(name);
+        if (!counter)
+            throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter does not exist");
+        if (typeof generationValue !== "string" || !/^[1-9][0-9]*$/.test(generationValue) || BigInt(generationValue) !== counter.generation)
+            throw new ProcessDomainFatalError("LEASE_REJECTED", "stale cycle counter generation");
+        return counter;
+    }
+    requireCounter(state, nameValue, participant, generationValue) {
+        const counter = this.requireCounterGeneration(state, nameValue, generationValue);
+        if (counter.ownerParticipantId !== participant.participantId)
+            throw new ProcessDomainFatalError("LEASE_REJECTED", "cycle counter owner mismatch");
+        return counter;
+    }
+    counterWire(counter) {
+        return {
+            name: counter.name,
+            value: counter.value.toString(),
+            paused: counter.paused,
+            generation: counter.generation.toString(),
+            ownerParticipantId: counter.ownerParticipantId,
+        };
     }
     clearReservationTimer(res) {
         if (res.timer)
@@ -597,6 +702,13 @@ export class Broker {
         const p = state.participants.get(participantId);
         if (!p)
             return;
+        for (const counter of state.cycleCounters.values()) {
+            if (counter.ownerParticipantId === participantId) {
+                counter.ownerParticipantId = null;
+                counter.generation += 1n;
+                this.broadcastCycleCounter(state, cycleCounterSnapshot(counter));
+            }
+        }
         state.participants.delete(participantId);
         state.revision += 1n;
         state.activityGeneration += 1n;
@@ -681,6 +793,14 @@ export class Broker {
         for (const conn of this.conns) {
             if (conn.domainState === state && conn.peer && conn.participantId) {
                 void conn.peer.rpc.$callEvent("snapshot", snap);
+            }
+        }
+    }
+    broadcastCycleCounter(state, counter) {
+        const payload = this.counterWire(counter);
+        for (const conn of this.conns) {
+            if (conn.domainState === state && conn.peer && conn.participantId) {
+                void conn.peer.rpc.$callEvent("cycleCounter", payload);
             }
         }
     }

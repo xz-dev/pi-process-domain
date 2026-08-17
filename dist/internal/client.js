@@ -48,6 +48,14 @@ function wireToSnapshot(wire, domainId) {
     });
 }
 /** Return a wire object omitting any `undefined` values (canonical layer rejects them). */
+function wireToCycleCounter(wire, name) {
+    if (typeof wire !== "object" || wire === null)
+        throw new ProcessDomainFatalError("DOMAIN_UNRECOVERABLE", "broker returned malformed cycle counter");
+    const value = wire;
+    if (value.name !== name || typeof value.value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value.value) || typeof value.paused !== "boolean" || typeof value.generation !== "string" || !/^(0|[1-9][0-9]*)$/.test(value.generation) || (value.ownerParticipantId !== null && typeof value.ownerParticipantId !== "string"))
+        throw new ProcessDomainFatalError("DOMAIN_UNRECOVERABLE", "broker returned malformed cycle counter");
+    return { name, value: BigInt(value.value), paused: value.paused, generation: BigInt(value.generation), ownerParticipantId: value.ownerParticipantId };
+}
 function compact(obj) {
     const out = {};
     for (const [k, v] of Object.entries(obj)) {
@@ -68,6 +76,7 @@ export class DomainClient {
     lastSnapshot;
     listeners = new Set();
     signalListeners = new Map();
+    cycleCounterListeners = new Map();
     closed = false;
     fatalEmitted = false;
     reconnectTimer = null;
@@ -316,6 +325,11 @@ export class DomainClient {
                 this.dispatchSignal(payload);
                 return { ok: true };
             },
+            cycleCounter: async (payload) => {
+                const name = typeof payload.name === "string" ? payload.name : "";
+                this.dispatchCycleCounter(wireToCycleCounter(payload, name));
+                return { ok: true };
+            },
         };
         const peer = createRpcPeer(raw, local);
         this.peer = peer;
@@ -353,6 +367,12 @@ export class DomainClient {
             delete process.env.PI_PROCESS_DOMAIN_RESERVATION;
         this.everJoined = true;
         this.startHeartbeat();
+        if (this.cycleCounterListeners.size > 0) {
+            await Promise.all(Array.from(this.cycleCounterListeners.keys(), async (name) => {
+                const counter = await this.getCycleCounter(name);
+                this.dispatchCycleCounter(counter);
+            }));
+        }
     }
     startHeartbeat() {
         if (this.heartbeatTimer)
@@ -504,6 +524,58 @@ export class DomainClient {
         this.listeners.add(listener);
         return () => this.listeners.delete(listener);
     }
+    async claimCycleCounter(name) {
+        const peer = this.requirePeer();
+        const result = await peer.rpc.$call("claimCycleCounter", { name });
+        return wireToCycleCounter(result.counter, name);
+    }
+    async getCycleCounter(name) {
+        const peer = this.requirePeer();
+        const result = await peer.rpc.$call("getCycleCounter", { name });
+        return wireToCycleCounter(result.counter, name);
+    }
+    subscribeCycleCounter(name, listener) {
+        let set = this.cycleCounterListeners.get(name);
+        if (!set) {
+            set = new Set();
+            this.cycleCounterListeners.set(name, set);
+        }
+        set.add(listener);
+        return () => {
+            set?.delete(listener);
+            if (set?.size === 0)
+                this.cycleCounterListeners.delete(name);
+        };
+    }
+    dispatchCycleCounter(counter) {
+        const listeners = this.cycleCounterListeners.get(counter.name);
+        if (!listeners)
+            return;
+        for (const listener of Array.from(listeners)) {
+            try {
+                listener(counter);
+            }
+            catch {
+                /* listener error isolated */
+            }
+        }
+    }
+    async incrementCycleCounter(name, delta = 1n, generation) {
+        const current = generation === undefined ? await this.getCycleCounter(name) : undefined;
+        const peer = this.requirePeer();
+        const result = await peer.rpc.$call("incrementCycleCounter", { name, delta: delta.toString(), generation: (generation ?? current.generation).toString() });
+        return wireToCycleCounter(result.counter, name);
+    }
+    async resetCycleCounter(name, generation) {
+        const peer = this.requirePeer();
+        const result = await peer.rpc.$call("resetCycleCounter", { name, generation: generation.toString() });
+        return wireToCycleCounter(result.counter, name);
+    }
+    async setCycleCounterPaused(name, paused, generation) {
+        const peer = this.requirePeer();
+        const result = await peer.rpc.$call("setCycleCounterPaused", { name, paused, generation: generation.toString() });
+        return wireToCycleCounter(result.counter, name);
+    }
     async publish(name, value) {
         const peer = this.requirePeer();
         let encoded;
@@ -589,6 +661,7 @@ export class DomainClient {
         this.resetTransport();
         this.listeners.clear();
         this.signalListeners.clear();
+        this.cycleCounterListeners.clear();
         const pending = this.pendingConfirms;
         this.pendingConfirms = [];
         for (const item of pending)

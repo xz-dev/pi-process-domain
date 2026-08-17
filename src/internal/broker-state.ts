@@ -20,7 +20,7 @@
 
 import { randomBytes } from "node:crypto";
 import { base64url, sha256Hex } from "./auth.js";
-import { computeSnapshot, type ActivityState, type DomainSnapshot } from "./domain-types.js";
+import { computeSnapshot, type ActivityState, type CycleCounterSnapshot, type DomainSnapshot } from "./domain-types.js";
 
 export const DEFAULT_HEARTBEAT_MS = 2000;
 export const SUSPECT_MS = 6000;
@@ -40,6 +40,9 @@ export const MAX_METADATA_KEY_LENGTH = 64;
 export const MAX_METADATA_VALUE_LENGTH = 4096;
 export const MAX_SIGNAL_NAME_LENGTH = 128;
 export const MAX_SIGNAL_VALUE_BYTES = 64 * 1024;
+export const MAX_CYCLE_COUNTERS_PER_DOMAIN = 64;
+export const MAX_CYCLE_COUNTER_NAME_LENGTH = 128;
+export const MAX_CYCLE_COUNTER_VALUE = 9223372036854775807n;
 export const MAX_PARTICIPANT_ID_LENGTH = 128;
 export const MAX_DOMAIN_ID_LENGTH = 128;
 export const MIN_INCARNATION = 1n;
@@ -67,6 +70,14 @@ export interface ReservationLease {
   timer?: ReturnType<typeof setTimeout>;
 }
 
+export interface CycleCounterState {
+  name: string;
+  value: bigint;
+  paused: boolean;
+  generation: bigint;
+  ownerParticipantId: string | null;
+}
+
 export interface DomainState {
   domainId: string;
   domainAuthKey: Uint8Array;
@@ -75,6 +86,7 @@ export interface DomainState {
   activityGeneration: bigint;
   participants: Map<string, ParticipantLease>;
   reservations: Map<string, ReservationLease>;
+  cycleCounters: Map<string, CycleCounterState>;
   /** True when the membership/lease state is authoritatively known. */
   certain: boolean;
   /** When set, certainty may become true only after this timestamp (recovery window). */
@@ -98,6 +110,7 @@ export function newDomain(
     activityGeneration: 0n,
     participants: new Map(),
     reservations: new Map(),
+    cycleCounters: new Map(),
     certain: !recover,
     recoveryDeadline: recover ? Date.now() + RECOVERY_MS : null,
     recoveryParticipantSeen: !recover,
@@ -123,6 +136,16 @@ export function hashToken(token: Uint8Array): string {
 
 export function reservationToken(): Uint8Array {
   return randomBytes(32);
+}
+
+export function cycleCounterSnapshot(counter: CycleCounterState): CycleCounterSnapshot {
+  return {
+    name: counter.name,
+    value: counter.value,
+    paused: counter.paused,
+    generation: counter.generation,
+    ownerParticipantId: counter.ownerParticipantId,
+  };
 }
 
 export function snapshotOf(state: DomainState): DomainSnapshot {

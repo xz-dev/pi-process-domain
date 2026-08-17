@@ -24,7 +24,7 @@ import {
   unbase64url,
 } from "./auth.js";
 import { decodeReservationClaim, type DomainDeclaration } from "./declaration.js";
-import { computeSnapshot, type ActivityState, type DomainFence, type DomainSignal, type DomainSnapshot } from "./domain-types.js";
+import { computeSnapshot, type ActivityState, type CycleCounterSnapshot, type DomainFence, type DomainSignal, type DomainSnapshot } from "./domain-types.js";
 import { ProcessDomainFatalError, isProcessDomainFatalError, type ProcessDomainFatalCode } from "./errors.js";
 import { type CanonicalObject } from "./framing.js";
 import { RawChannel, createRpcPeer } from "./rpc.js";
@@ -75,6 +75,14 @@ function wireToSnapshot(wire: Record<string, unknown>, domainId: string): Domain
 }
 
 /** Return a wire object omitting any `undefined` values (canonical layer rejects them). */
+function wireToCycleCounter(wire: unknown, name: string): CycleCounterSnapshot {
+  if (typeof wire !== "object" || wire === null) throw new ProcessDomainFatalError("DOMAIN_UNRECOVERABLE", "broker returned malformed cycle counter");
+  const value = wire as Record<string, unknown>;
+  if (value.name !== name || typeof value.value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value.value) || typeof value.paused !== "boolean" || typeof value.generation !== "string" || !/^(0|[1-9][0-9]*)$/.test(value.generation) || (value.ownerParticipantId !== null && typeof value.ownerParticipantId !== "string"))
+    throw new ProcessDomainFatalError("DOMAIN_UNRECOVERABLE", "broker returned malformed cycle counter");
+  return { name, value: BigInt(value.value), paused: value.paused, generation: BigInt(value.generation), ownerParticipantId: value.ownerParticipantId as string | null };
+}
+
 function compact(obj: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj)) {
@@ -95,6 +103,7 @@ export class DomainClient {
   private lastSnapshot: DomainSnapshot;
   private listeners = new Set<(s: DomainSnapshot) => void>();
   private signalListeners = new Map<string, Set<(s: DomainSignal) => void>>();
+  private cycleCounterListeners = new Map<string, Set<(counter: CycleCounterSnapshot) => void>>();
   private closed = false;
   private fatalEmitted = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -356,6 +365,11 @@ export class DomainClient {
         this.dispatchSignal(payload);
         return { ok: true };
       },
+      cycleCounter: async (payload: Record<string, unknown>): Promise<Record<string, unknown>> => {
+        const name = typeof payload.name === "string" ? payload.name : "";
+        this.dispatchCycleCounter(wireToCycleCounter(payload, name));
+        return { ok: true };
+      },
     };
     const peer = createRpcPeer(raw, local);
     this.peer = peer;
@@ -392,6 +406,14 @@ export class DomainClient {
     if (claim) delete process.env.PI_PROCESS_DOMAIN_RESERVATION;
     this.everJoined = true;
     this.startHeartbeat();
+    if (this.cycleCounterListeners.size > 0) {
+      await Promise.all(
+        Array.from(this.cycleCounterListeners.keys(), async (name) => {
+          const counter = await this.getCycleCounter(name);
+          this.dispatchCycleCounter(counter);
+        }),
+      );
+    }
   }
 
   private startHeartbeat(): void {
@@ -549,6 +571,63 @@ export class DomainClient {
     return () => this.listeners.delete(listener);
   }
 
+  async claimCycleCounter(name: string): Promise<CycleCounterSnapshot> {
+    const peer = this.requirePeer();
+    const result = await peer.rpc.$call("claimCycleCounter", { name }) as { counter: unknown };
+    return wireToCycleCounter(result.counter, name);
+  }
+
+  async getCycleCounter(name: string): Promise<CycleCounterSnapshot> {
+    const peer = this.requirePeer();
+    const result = await peer.rpc.$call("getCycleCounter", { name }) as { counter: unknown };
+    return wireToCycleCounter(result.counter, name);
+  }
+
+  subscribeCycleCounter(name: string, listener: (counter: CycleCounterSnapshot) => void): () => void {
+    let set = this.cycleCounterListeners.get(name);
+    if (!set) {
+      set = new Set();
+      this.cycleCounterListeners.set(name, set);
+    }
+    set.add(listener);
+    return () => {
+      set?.delete(listener);
+      if (set?.size === 0) this.cycleCounterListeners.delete(name);
+    };
+  }
+
+  private dispatchCycleCounter(counter: CycleCounterSnapshot): void {
+    const listeners = this.cycleCounterListeners.get(counter.name);
+    if (!listeners) return;
+    for (const listener of Array.from(listeners)) {
+      try {
+        listener(counter);
+      }
+      catch {
+        /* listener error isolated */
+      }
+    }
+  }
+
+  async incrementCycleCounter(name: string, delta = 1n, generation?: bigint): Promise<CycleCounterSnapshot> {
+    const current = generation === undefined ? await this.getCycleCounter(name) : undefined;
+    const peer = this.requirePeer();
+    const result = await peer.rpc.$call("incrementCycleCounter", { name, delta: delta.toString(), generation: (generation ?? current!.generation).toString() }) as { counter: unknown };
+    return wireToCycleCounter(result.counter, name);
+  }
+
+  async resetCycleCounter(name: string, generation: bigint): Promise<CycleCounterSnapshot> {
+    const peer = this.requirePeer();
+    const result = await peer.rpc.$call("resetCycleCounter", { name, generation: generation.toString() }) as { counter: unknown };
+    return wireToCycleCounter(result.counter, name);
+  }
+
+  async setCycleCounterPaused(name: string, paused: boolean, generation: bigint): Promise<CycleCounterSnapshot> {
+    const peer = this.requirePeer();
+    const result = await peer.rpc.$call("setCycleCounterPaused", { name, paused, generation: generation.toString() }) as { counter: unknown };
+    return wireToCycleCounter(result.counter, name);
+  }
+
   async publish(name: string, value: unknown): Promise<void> {
     const peer = this.requirePeer();
     let encoded: string;
@@ -633,6 +712,7 @@ export class DomainClient {
     this.resetTransport();
     this.listeners.clear();
     this.signalListeners.clear();
+    this.cycleCounterListeners.clear();
     const pending = this.pendingConfirms;
     this.pendingConfirms = [];
     for (const item of pending) item.resolve(false);

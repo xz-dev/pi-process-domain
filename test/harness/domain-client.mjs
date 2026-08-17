@@ -20,7 +20,72 @@ try {
   }
   const { domain, created } = await openDomain(options);
 
-  if (command === "root-loss") {
+  if (command === "counter-owner") {
+    const name = process.env.TEST_COUNTER_NAME ?? "acceptance.cycles";
+    const claimed = await domain.claimCycleCounter(name);
+    output({ ready: true, created, env: {
+      PI_PROCESS_DOMAIN_ID: process.env.PI_PROCESS_DOMAIN_ID,
+      PI_PROCESS_DOMAIN_KEY: process.env.PI_PROCESS_DOMAIN_KEY,
+      PI_PROCESS_DOMAIN_PROTOCOL: process.env.PI_PROCESS_DOMAIN_PROTOCOL,
+    }, claimed });
+    const waitForFile = async (path) => {
+      if (!path) return;
+      for (;;) {
+        try { await readFile(path); return; }
+        catch { await new Promise((resolve) => setTimeout(resolve, 25)); }
+      }
+    };
+    if (process.env.TEST_COUNTER_PAUSE_FILE) {
+      await waitForFile(process.env.TEST_COUNTER_PAUSE_FILE);
+      output({ phase: "paused", counter: await domain.setCycleCounterPaused(name, true, claimed.generation) });
+      await waitForFile(process.env.TEST_COUNTER_RESET_FILE);
+      const reset = await domain.resetCycleCounter(name, claimed.generation);
+      output({ phase: "reset", counter: reset });
+      await domain.setCycleCounterPaused(name, false, reset.generation);
+      output({ phase: "resumed", counter: await domain.getCycleCounter(name) });
+    }
+    const finish = async () => {
+      await domain.close();
+      process.exit(0);
+    };
+    process.on("SIGTERM", () => void finish());
+    process.on("SIGINT", () => void finish());
+    setInterval(() => {}, 60_000);
+  }
+  else if (command === "counter-increment" || command === "counter-get") {
+    const name = process.env.TEST_COUNTER_NAME ?? "acceptance.cycles";
+    if (command === "counter-get") {
+      output({ created, counter: await domain.getCycleCounter(name) });
+      await domain.close();
+    } else {
+      const generation = BigInt(process.env.TEST_COUNTER_GENERATION ?? "0");
+      const delta = BigInt(process.env.TEST_COUNTER_DELTA ?? "1");
+      const counter = await domain.incrementCycleCounter(name, delta, generation);
+      output({ created, counter });
+      await domain.close();
+    }
+  }
+  else if (command === "counter-increment-unused") {
+    const name = process.env.TEST_COUNTER_NAME ?? "acceptance.cycles";
+    const generation = BigInt(process.env.TEST_COUNTER_GENERATION ?? "0");
+    const delta = BigInt(process.env.TEST_COUNTER_DELTA ?? "1");
+    const counter = await domain.incrementCycleCounter(name, delta, generation);
+    output({ created, counter });
+    await domain.close();
+  }
+  else if (command === "counter-observe") {
+    const name = process.env.TEST_COUNTER_NAME ?? "acceptance.cycles";
+    const observed = [];
+    const unsubscribe = domain.subscribeCycleCounter(name, (counter) => observed.push(counter));
+    const ready = await domain.getCycleCounter(name);
+    output({ ready: true, created, counter: ready });
+    await new Promise((resolve) => setTimeout(resolve, Number(process.env.TEST_OBSERVE_MS ?? 1000)));
+    unsubscribe();
+    output({ counter: await domain.getCycleCounter(name), observed });
+    await domain.close();
+    process.exit(0);
+  }
+  else if (command === "root-loss") {
     const observed = [];
     const unsubscribe = domain.subscribe((snapshot) => observed.push(snapshot));
     output({ ready: true, created, endpoint: brokerEndpoint(), snapshot: domain.snapshot() });
@@ -182,5 +247,8 @@ catch (error) {
     exitCode: process.exitCode ?? null,
     overriddenFatal,
   });
-  if (command !== "caught") process.exitCode = 78;
+  if (command !== "caught") {
+    process.exitCode = 78;
+    process.exit();
+  }
 }

@@ -37,6 +37,9 @@ export const MAX_METADATA_KEY_LENGTH = 64;
 export const MAX_METADATA_VALUE_LENGTH = 4096;
 export const MAX_SIGNAL_NAME_LENGTH = 128;
 export const MAX_SIGNAL_VALUE_BYTES = 64 * 1024;
+export const MAX_CYCLE_COUNTERS_PER_DOMAIN = 64;
+export const MAX_CYCLE_COUNTER_NAME_LENGTH = 128;
+export const MAX_CYCLE_COUNTER_VALUE = 9223372036854775807n;
 export const MAX_PARTICIPANT_ID_LENGTH = 128;
 export const MAX_DOMAIN_ID_LENGTH = 128;
 export const MIN_INCARNATION = 1n;
@@ -51,6 +54,7 @@ export function newDomain(domainId, domainAuthKey, opts = {}) {
         activityGeneration: 0n,
         participants: new Map(),
         reservations: new Map(),
+        cycleCounters: new Map(),
         certain: !recover,
         recoveryDeadline: recover ? Date.now() + RECOVERY_MS : null,
         recoveryParticipantSeen: !recover,
@@ -71,6 +75,15 @@ export function hashToken(token) {
 }
 export function reservationToken() {
     return randomBytes(32);
+}
+export function cycleCounterSnapshot(counter) {
+    return {
+        name: counter.name,
+        value: counter.value,
+        paused: counter.paused,
+        generation: counter.generation,
+        ownerParticipantId: counter.ownerParticipantId,
+    };
 }
 export function snapshotOf(state) {
     let busy = 0;

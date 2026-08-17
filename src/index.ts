@@ -20,6 +20,7 @@ import { ProcessDomainFatalError, isProcessDomainFatalError, FATAL_EXIT_CODE } f
 import { resolveEndpoint } from "./internal/runtime-path.js";
 import type {
   ActivityState,
+  CycleCounterSnapshot,
   DomainFence,
   DomainSignal,
   DomainSnapshot,
@@ -30,6 +31,7 @@ import type {
 
 export type {
   ActivityState,
+  CycleCounterSnapshot,
   DomainFence,
   DomainSignal,
   DomainSnapshot,
@@ -50,8 +52,10 @@ export const ENV_NAMES = {
 export interface OpenDomainResult {
   /** The process-domain handle (already joined as a participant). */
   domain: ProcessDomain;
-  /** True when this process created a brand-new domain declaration. */
+  /** True when this call created a brand-new domain declaration. */
   created: boolean;
+  /** True when this OS process owns the embedded protocol-2 broker. */
+  hosted: boolean;
 }
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
@@ -151,8 +155,8 @@ export async function openDomain(options?: Partial<OpenDomainOptions>): Promise<
     if (root !== undefined && process.env[ENV_NAMES.DOMAIN_ID] === undefined) {
       publishDeclaration(root.declaration);
     }
-    if (root === undefined) return { domain: client as unknown as ProcessDomain, created };
-    return { domain: ownedDomain(client, host, root), created };
+    if (root === undefined) return { domain: client as unknown as ProcessDomain, created, hosted: false };
+    return { domain: ownedDomain(client, host, root), created, hosted: true };
   }
   catch (error) {
     const fatal = isProcessDomainFatalError(error)
@@ -176,6 +180,12 @@ function ownedDomain(client: DomainClient, host: EmbeddedRootHost, root: Embedde
     subscribe: (listener) => client.subscribe(listener),
     publish: (name, value) => client.publish(name, value),
     subscribeSignals: (name, listener) => client.subscribeSignals(name, listener),
+    claimCycleCounter: (name) => client.claimCycleCounter(name),
+    getCycleCounter: (name) => client.getCycleCounter(name),
+    subscribeCycleCounter: (name, listener) => client.subscribeCycleCounter(name, listener),
+    incrementCycleCounter: (name, delta, generation) => client.incrementCycleCounter(name, delta, generation),
+    resetCycleCounter: (name, generation) => client.resetCycleCounter(name, generation),
+    setCycleCounterPaused: (name, paused, generation) => client.setCycleCounterPaused(name, paused, generation),
     confirm: (fence) => client.confirm(fence),
     async close(): Promise<void> {
       if (closed) return;

@@ -7,8 +7,8 @@
  * retain the legacy shared-client path for already-running sessions only.
  */
 import { ProcessDomainFatalError, isProcessDomainFatalError, FATAL_EXIT_CODE } from "./internal/errors.js";
-import type { ActivityState, DomainFence, DomainSignal, DomainSnapshot, OpenDomainOptions, ProcessDomain, SpawnReservation } from "./internal/domain-types.js";
-export type { ActivityState, DomainFence, DomainSignal, DomainSnapshot, OpenDomainOptions, ProcessDomain, SpawnReservation, };
+import type { ActivityState, CycleCounterSnapshot, DomainFence, DomainSignal, DomainSnapshot, OpenDomainOptions, ProcessDomain, SpawnReservation } from "./internal/domain-types.js";
+export type { ActivityState, CycleCounterSnapshot, DomainFence, DomainSignal, DomainSnapshot, OpenDomainOptions, ProcessDomain, SpawnReservation, };
 export { ProcessDomainFatalError, isProcessDomainFatalError, FATAL_EXIT_CODE };
 /** Environment variable names that form a domain declaration. */
 export declare const ENV_NAMES: {
@@ -20,8 +20,10 @@ export declare const ENV_NAMES: {
 export interface OpenDomainResult {
     /** The process-domain handle (already joined as a participant). */
     domain: ProcessDomain;
-    /** True when this process created a brand-new domain declaration. */
+    /** True when this call created a brand-new domain declaration. */
     created: boolean;
+    /** True when this OS process owns the embedded protocol-2 broker. */
+    hosted: boolean;
 }
 /**
  * Open (join) a process domain.
