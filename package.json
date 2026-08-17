@@ -1,9 +1,17 @@
 {
-  "name": "pi-process-domain",
+  "name": "pi-extension-utils",
   "version": "1.0.0",
   "type": "module",
-  "description": "Authenticated cross-Pi process-domain coordination for exact idle/snapshot and reservation-before-spawn.",
+  "description": "Shared process transport, Pi inquiry, and strict XML utilities for Pi extensions.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xz-dev/pi-extension-utils.git"
+  },
+  "homepage": "https://github.com/xz-dev/pi-extension-utils#readme",
+  "bugs": {
+    "url": "https://github.com/xz-dev/pi-extension-utils/issues"
+  },
   "engines": {
     "node": ">=22.19.0"
   },
@@ -15,24 +23,32 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./process-domain": {
+      "types": "./dist/process-domain/index.d.ts",
+      "import": "./dist/process-domain/index.js"
+    },
+    "./xml": {
+      "types": "./dist/xml.d.ts",
+      "import": "./dist/xml.js"
+    },
+    "./pi-inquiry": {
+      "types": "./dist/pi-inquiry.d.ts",
+      "import": "./dist/pi-inquiry.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
     "dist",
-    "bin",
     "LICENSE",
     "README.md",
     "THIRD_PARTY_NOTICES.md"
   ],
-  "bin": {
-    "pi-process-domain-broker": "bin/pi-process-domain-broker.mjs"
-  },
   "scripts": {
-    "build:dist": "tsc -p tsconfig.build.json",
+    "build:dist": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:unit": "vitest run test/unit",
+    "test:unit": "vitest run test/*.test.ts",
     "test:acceptance": "node test/run-acceptance.mjs",
     "check": "npm run typecheck && npm run lint && npm run build:dist && npm run test:unit && npm run test:acceptance"
   },
@@ -45,5 +61,10 @@
     "typescript-eslint": "^8.57.0",
     "vitest": "^4.1.0"
   },
-  "dependencies": {}
+  "dependencies": {
+    "zeromq": "^6.6.0"
+  },
+  "allowScripts": {
+    "zeromq": true
+  }
 }
