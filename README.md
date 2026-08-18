@@ -1,17 +1,18 @@
 # pi-extension-utils
 
-Shared utilities for Pi extensions. The package exposes independent entry points so XML-only consumers never load the native ZeroMQ binding.
+Shared utilities for Pi extensions. The package exposes independent entry points and has no runtime dependencies or native bindings.
 
 ## Process domain
 
 `pi-extension-utils/process-domain` provides one root-owned local transport and inherited child nodes:
 
-- ZeroMQ `ROUTER`/`DEALER` messaging with directed sends, broadcast, receive acknowledgements, and peer events;
-- ZMTP heartbeat options for transport liveness; no application heartbeat protocol;
+- framed messaging over loopback TCP (`node:net`) with directed sends, broadcast, receive acknowledgements, and peer events;
+- application-level ping/pong heartbeat options for liveness, so a frozen peer is reported even though the kernel keeps its connection open;
 - Pi lifecycle forwarding without imposing a watchdog state machine;
-- ZeroMQ-generated temporary endpoints only: `ipc://*` when `zeromq.capability.ipc` is true, otherwise `tcp://127.0.0.1:*`;
-- one bootstrap endpoint plus a temporary endpoint per child so a ZeroMQ disconnect maps to one exact node;
+- one listener on an ephemeral loopback port (`tcp://127.0.0.1:*`); every peer is one exact connection, so a disconnect maps to one exact node;
 - an inherited authenticated declaration in `PI_EXTENSION_UTILS_PROCESS_DOMAIN`.
+
+The wire format is a 4-byte big-endian length prefix carrying a strictly validated JSON envelope (64 KiB bound, fail-closed). Authentication is a per-connection HMAC challenge-response: fresh nonces on every connection make consumed proofs useless for replay, and a reconnecting peer fences and replaces its stale incarnation. Reconnects open a brand-new connection and rerun the full handshake; pending sends fail instead of being replayed. A receipt acknowledgement resolves once the message reaches the target peer; routed messages acknowledge only after every downstream hop acknowledged.
 
 ```ts
 import { attachPiLifecycle, openProcessDomain } from "pi-extension-utils/process-domain";
@@ -31,7 +32,7 @@ Startup failures are exposed as `ProcessDomainOpenError` with a stable `code`: `
 
 ## XML
 
-`pi-extension-utils/xml` builds and strictly parses one unique trailing XML document, extracts non-thinking assistant text, and neutralizes a finalized assistant message without importing Pi or ZeroMQ.
+`pi-extension-utils/xml` builds and strictly parses one unique trailing XML document, extracts non-thinking assistant text, and neutralizes a finalized assistant message without importing Pi.
 
 ```ts
 import { buildXmlDocument, parseTrailingXml } from "pi-extension-utils/xml";
@@ -48,7 +49,7 @@ const result = parseTrailingXml(`Checked.\n${example}`, "reflection");
 
 ## Runtime support
 
-The published `zeromq` package officially targets Node.js through N-API. Other N-API runtimes may work when they can load the installed zeromq native binary, but this package does not claim support beyond the runtimes verified by its acceptance suite. Endpoint selection is based only on `zeromq.capability.ipc`, never on an operating-system name.
+process-domain relies only on the portable `node:net`/`node:crypto` surface and runs the same TypeScript on Node.js, Bun, and Deno, including their standalone compiled forms. The same full liveness/reconnect acceptance file runs under all three hosts (`test:acceptance`, `test:acceptance:bun`, and `test:acceptance:deno`). The Deno harness uses `Deno.kill()` for Unix stop/continue signals because Deno 2.9.5's `node:child_process` shim incorrectly treats `killed` as a one-shot guard: after a successful `SIGSTOP`, `ChildProcess.kill("SIGCONT")` returns `false` without sending the signal. This is a Deno Node-compatibility bug, not a transport limitation. Compiled Bun and Deno host startup smoke tests are also verified.
 
 ## Development
 

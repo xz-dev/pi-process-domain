@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { attachPiLifecycle, ENV_NAMES, openProcessDomain, preferredTransport, wildcardEndpoint } from "../src/process-domain/index.js";
 
 describe("process-domain transport", () => {
-  it("selects an official ZeroMQ wildcard endpoint from capabilities", () => {
+  it("selects the loopback TCP wildcard endpoint", () => {
     const transport = preferredTransport();
     expect(wildcardEndpoint()).toBe(transport === "ipc" ? "ipc://*" : "tcp://127.0.0.1:*");
   });
@@ -68,6 +68,36 @@ describe("process-domain transport", () => {
       await child.close();
       expect(clientEnv[ENV_NAMES.DECLARATION]).toBe(inherited);
     } finally {
+      await root.close();
+    }
+  });
+
+  it("reconnects after the host connection drops and resumes messaging", async () => {
+    const timing = { connectTimeoutMs: 2_000, heartbeatIntervalMs: 50, heartbeatTimeoutMs: 200, heartbeatTimeToLiveMs: 100 } as const;
+    const rootEnv: NodeJS.ProcessEnv = {};
+    const root = await openProcessDomain({ env: rootEnv, ...timing });
+    const child = await openProcessDomain({ env: { [ENV_NAMES.DECLARATION]: rootEnv[ENV_NAMES.DECLARATION] }, ...timing });
+    const waitPeer = (node: typeof child, nodeId: string, status: "online" | "offline") => new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`peer did not become ${status}`)), 5_000);
+      const stop = node.subscribeEvents((event) => {
+        if (event.type === "peer" && event.peer.nodeId === nodeId && event.peer.status === status) {
+          clearTimeout(timer);
+          stop();
+          resolve();
+        }
+      });
+    });
+    try {
+      const offline = waitPeer(child, root.nodeId, "offline");
+      (child as unknown as { ownLink: { close(): void } | null }).ownLink?.close();
+      await offline;
+      await expect(child.send(root.nodeId, "during-offline", null)).rejects.toThrow("process-domain host is offline");
+      await waitPeer(child, root.nodeId, "online");
+      const received = new Promise<unknown>((resolve) => child.subscribe("after-reconnect", (message) => resolve(message.value)));
+      await root.send(child.nodeId, "after-reconnect", { ok: true });
+      await expect(received).resolves.toEqual({ ok: true });
+    } finally {
+      await child.close();
       await root.close();
     }
   });

@@ -185,6 +185,8 @@ function isValidEnvelope(value) {
                 isValidId(value.senderId) &&
                 isValidLifecycleEvent(value.event));
         case "ack":
+        case "ping":
+        case "pong":
             return hasExactKeys(value, ["version", "type", "id"]) && isValidId(value.id);
         default:
             return false;

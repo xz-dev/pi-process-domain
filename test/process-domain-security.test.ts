@@ -1,11 +1,10 @@
-import { Dealer, Router, type Message } from "zeromq";
 import { describe, expect, it } from "vitest";
-import { bindTemporaryEndpoint } from "../src/process-domain/endpoint.js";
 import {
   ENV_NAMES,
   isProcessDomainOpenError,
   openProcessDomain,
 } from "../src/process-domain/index.js";
+import { connectLoopback, listenLoopback, type FrameLink } from "../src/process-domain/net.js";
 import {
   createProof,
   decodeDeclaration,
@@ -25,13 +24,6 @@ const timing = {
   heartbeatTimeToLiveMs: 100,
 } as const;
 
-const socketTiming = {
-  heartbeatInterval: timing.heartbeatIntervalMs,
-  heartbeatTimeout: timing.heartbeatTimeoutMs,
-  heartbeatTimeToLive: timing.heartbeatTimeToLiveMs,
-  linger: 0,
-} as const;
-
 function wait<T>(promise: Promise<T>, timeoutMs = 2_000, label = "operation"): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`test wait timed out: ${label}`)), timeoutMs);
@@ -42,21 +34,98 @@ function wait<T>(promise: Promise<T>, timeoutMs = 2_000, label = "operation"): P
   });
 }
 
-function receive(socket: Dealer, label = "DEALER receive"): Promise<WireEnvelope> {
-  return wait(socket.receive().then((frames) => {
-    const frame = frames.at(-1);
-    if (frame === undefined) throw new Error("missing ZeroMQ frame");
-    return decodeEnvelope(Buffer.from(frame));
-  }), 2_000, label);
+/** A minimal framed client speaking the wire protocol, auto-answering liveness pings. */
+interface RawPeer {
+  readonly nodeId: string;
+  readonly declaration: ProcessDomainDeclaration;
+  readonly link: FrameLink;
+  /** Resolves once the link reports closure (host-initiated or local). */
+  readonly closed: Promise<void>;
+  send(envelope: WireEnvelope): Promise<void>;
+  receive(label?: string): Promise<WireEnvelope>;
 }
 
-async function receiveRouter(socket: Router): Promise<{ identity: Buffer; envelope: WireEnvelope }> {
-  const frames = await wait(socket.receive());
-  const parts = frames as Message[];
-  const identity = parts[0];
-  const frame = parts.at(-1);
-  if (identity === undefined || frame === undefined) throw new Error("missing ROUTER frame");
-  return { identity: Buffer.from(identity), envelope: decodeEnvelope(Buffer.from(frame)) };
+function connectRaw(declaration: ProcessDomainDeclaration, nodeId = randomId()): Promise<RawPeer> {
+  return connectLoopback(declaration.endpoint, 2_000, "raw connect timed out").then((link) => {
+    const inbox: WireEnvelope[] = [];
+    const waiters: Array<{ resolve: (envelope: WireEnvelope) => void; reject: (error: Error) => void }> = [];
+    link.onFrame = (frame) => {
+      let envelope: WireEnvelope;
+      try {
+        envelope = decodeEnvelope(frame);
+      } catch {
+        return;
+      }
+      if (envelope.type === "ping") {
+        void link.send(encodeEnvelope({ version: PROCESS_DOMAIN_PROTOCOL, type: "pong", id: envelope.id }));
+        return;
+      }
+      const waiter = waiters.shift();
+      if (waiter !== undefined) waiter.resolve(envelope);
+      else inbox.push(envelope);
+    };
+    let markClosed!: () => void;
+    const closed = new Promise<void>((resolve) => { markClosed = resolve; });
+    link.onClose = () => {
+      markClosed();
+      for (const waiter of waiters.splice(0)) waiter.reject(new Error("raw link closed"));
+    };
+    link.onError = () => {};
+    return {
+      nodeId,
+      declaration,
+      link,
+      closed,
+      send(envelope: WireEnvelope): Promise<void> {
+        return link.send(encodeEnvelope(envelope));
+      },
+      receive(label = "raw receive"): Promise<WireEnvelope> {
+        const queued = inbox.shift();
+        if (queued !== undefined) return wait(Promise.resolve(queued), 2_000, label);
+        return wait(new Promise<WireEnvelope>((resolve, reject) => {
+          waiters.push({ resolve, reject });
+        }), 2_000, label);
+      },
+    };
+  });
+}
+
+async function authenticateRaw(peer: RawPeer, metadata: Readonly<Record<string, string>> = { role: "raw-test" }): Promise<WireEnvelope> {
+  const clientNonce = randomId();
+  await peer.send({
+    version: PROCESS_DOMAIN_PROTOCOL,
+    type: "challenge-request",
+    phase: "bootstrap",
+    domainId: peer.declaration.domainId,
+    nodeId: peer.nodeId,
+    clientNonce,
+  });
+  const challenge = await peer.receive("bootstrap challenge");
+  if (challenge.type !== "challenge") throw new Error("missing bootstrap challenge");
+  const bootstrap: WireEnvelope = {
+    version: PROCESS_DOMAIN_PROTOCOL,
+    type: "bootstrap",
+    domainId: peer.declaration.domainId,
+    nodeId: peer.nodeId,
+    metadata,
+    clientNonce,
+    serverNonce: challenge.serverNonce,
+    proof: createProof(peer.declaration.capability, "bootstrap", [
+      peer.declaration.domainId,
+      peer.nodeId,
+      metadata,
+      clientNonce,
+      challenge.serverNonce,
+    ]),
+  };
+  await peer.send(bootstrap);
+  const ready = await peer.receive("bootstrap ready");
+  if (ready.type !== "ready") throw new Error("missing ready response");
+  return bootstrap;
+}
+
+function ack(peer: RawPeer, id: string): Promise<void> {
+  return peer.send({ version: PROCESS_DOMAIN_PROTOCOL, type: "ack", id });
 }
 
 async function waitForPeer(root: ProcessDomainNode, nodeId: string, status: "online" | "offline"): Promise<void> {
@@ -69,88 +138,6 @@ async function waitForPeer(root: ProcessDomainNode, nodeId: string, status: "onl
       }
     });
   }), 2_000, `peer ${status}`);
-}
-
-interface RawPeer {
-  readonly nodeId: string;
-  readonly declaration: ProcessDomainDeclaration;
-  readonly endpoint: string;
-  socket: Dealer;
-}
-
-async function bootstrapRaw(declaration: ProcessDomainDeclaration): Promise<RawPeer> {
-  const nodeId = randomId();
-  const bootstrap = new Dealer({ ...socketTiming, routingId: nodeId });
-  bootstrap.connect(declaration.endpoint);
-  const clientNonce = randomId();
-  await bootstrap.send(encodeEnvelope({
-    version: PROCESS_DOMAIN_PROTOCOL,
-    type: "challenge-request",
-    phase: "bootstrap",
-    domainId: declaration.domainId,
-    nodeId,
-    clientNonce,
-  }));
-  const challenge = await receive(bootstrap, "bootstrap challenge");
-  if (challenge.type !== "challenge") throw new Error("missing bootstrap challenge");
-  await bootstrap.send(encodeEnvelope({
-    version: PROCESS_DOMAIN_PROTOCOL,
-    type: "bootstrap",
-    domainId: declaration.domainId,
-    nodeId,
-    metadata: { role: "raw-test" },
-    clientNonce,
-    serverNonce: challenge.serverNonce,
-    proof: createProof(declaration.capability, "bootstrap", [
-      declaration.domainId,
-      nodeId,
-      { role: "raw-test" },
-      clientNonce,
-      challenge.serverNonce,
-    ]),
-  }));
-  const ready = await receive(bootstrap, "bootstrap ready");
-  bootstrap.close();
-  if (ready.type !== "bootstrap-ready") throw new Error("missing bootstrap response");
-  const socket = new Dealer({ ...socketTiming, routingId: nodeId });
-  socket.connect(ready.endpoint);
-  return { nodeId, declaration, endpoint: ready.endpoint, socket };
-}
-
-async function authenticateRaw(peer: RawPeer): Promise<WireEnvelope> {
-  const clientNonce = randomId();
-  await peer.socket.send(encodeEnvelope({
-    version: PROCESS_DOMAIN_PROTOCOL,
-    type: "challenge-request",
-    phase: "hello",
-    domainId: peer.declaration.domainId,
-    nodeId: peer.nodeId,
-    clientNonce,
-  }));
-  const challenge = await receive(peer.socket, "hello challenge");
-  if (challenge.type !== "challenge") throw new Error("missing hello challenge");
-  const hello: WireEnvelope = {
-    version: PROCESS_DOMAIN_PROTOCOL,
-    type: "hello",
-    domainId: peer.declaration.domainId,
-    nodeId: peer.nodeId,
-    clientNonce,
-    serverNonce: challenge.serverNonce,
-    proof: createProof(peer.declaration.capability, "hello", [
-      peer.declaration.domainId,
-      peer.nodeId,
-      clientNonce,
-      challenge.serverNonce,
-    ]),
-  };
-  await peer.socket.send(encodeEnvelope(hello));
-  const ready = await receive(peer.socket, "hello ready");
-  if (ready.type !== "ready") throw new Error("missing ready response");
-  return hello;
-}
-
-function ack(socket: Dealer, id: string): Promise<void> {
-  return socket.send(encodeEnvelope({ version: PROCESS_DOMAIN_PROTOCOL, type: "ack", id }));
 }
 
 describe("process-domain authentication and concurrent sends", () => {
@@ -190,56 +177,68 @@ describe("process-domain authentication and concurrent sends", () => {
     expect(connectionFailure.message).not.toContain(unavailableEncoded);
   });
 
-  it("binds bootstrap responses to the inherited domain and host", async () => {
+  it("binds ready responses to the inherited domain and host", async () => {
     const capability = randomId(32);
     const domainId = randomId();
     const hostNodeId = randomId();
-    const bootstrap = new Router({ ...socketTiming, handover: false });
-    const bound = await bindTemporaryEndpoint(bootstrap);
+    const server = await listenLoopback();
     const declaration: ProcessDomainDeclaration = {
       version: PROCESS_DOMAIN_PROTOCOL,
       domainId,
-      endpoint: bound.endpoint,
+      endpoint: server.endpoint,
       capability,
       hostNodeId,
     };
-    const server = (async () => {
-      const request = await receiveRouter(bootstrap);
-      if (request.envelope.type !== "challenge-request") throw new Error("missing challenge request");
-      const serverNonce = randomId();
-      await bootstrap.send([request.identity, encodeEnvelope({
-        version: PROCESS_DOMAIN_PROTOCOL,
-        type: "challenge",
-        phase: "bootstrap",
-        domainId,
-        nodeId: request.envelope.nodeId,
-        clientNonce: request.envelope.clientNonce,
-        serverNonce,
-      })]);
-      const response = await receiveRouter(bootstrap);
-      if (response.envelope.type !== "bootstrap") throw new Error("missing bootstrap response");
-      const endpoint = "tcp://127.0.0.1:12345";
-      const responseDomainId = randomId();
-      const responseHostNodeId = randomId();
-      const responseServerNonce = randomId();
-      await bootstrap.send([response.identity, encodeEnvelope({
-        version: PROCESS_DOMAIN_PROTOCOL,
-        type: "bootstrap-ready",
-        domainId: responseDomainId,
-        nodeId: responseHostNodeId,
-        endpoint,
-        clientNonce: response.envelope.clientNonce,
-        serverNonce: responseServerNonce,
-        proof: createProof(capability, "bootstrap-ready", [
-          domainId,
-          responseHostNodeId,
-          response.envelope.nodeId,
-          endpoint,
-          response.envelope.clientNonce,
-          responseServerNonce,
-        ]),
-      })]);
-    })();
+    const serverDone = new Promise<void>((resolve, reject) => {
+      server.onConnection = (link) => {
+        let step = 0;
+        let clientNonce = "";
+        let peerNodeId = "";
+        link.onFrame = (frame) => {
+          void (async () => {
+            const envelope = decodeEnvelope(frame);
+            if (step === 0) {
+              if (envelope.type !== "challenge-request") throw new Error("missing challenge request");
+              step = 1;
+              clientNonce = envelope.clientNonce;
+              peerNodeId = envelope.nodeId;
+              await link.send(encodeEnvelope({
+                version: PROCESS_DOMAIN_PROTOCOL,
+                type: "challenge",
+                phase: "bootstrap",
+                domainId,
+                nodeId: envelope.nodeId,
+                clientNonce,
+                serverNonce: randomId(),
+              }));
+              return;
+            }
+            if (envelope.type !== "bootstrap") throw new Error("missing bootstrap");
+            const responseDomainId = randomId();
+            const responseHostNodeId = randomId();
+            const responseServerNonce = randomId();
+            await link.send(encodeEnvelope({
+              version: PROCESS_DOMAIN_PROTOCOL,
+              type: "ready",
+              domainId: responseDomainId,
+              nodeId: responseHostNodeId,
+              clientNonce,
+              serverNonce: responseServerNonce,
+              proof: createProof(capability, "ready", [
+                domainId,
+                responseHostNodeId,
+                peerNodeId,
+                clientNonce,
+                responseServerNonce,
+              ]),
+            }));
+            resolve();
+          })().catch(reject);
+        };
+        link.onError = () => {};
+        link.onClose = () => {};
+      };
+    });
     try {
       const failure = await openProcessDomain({
         env: { [ENV_NAMES.DECLARATION]: encodeDeclaration(declaration) },
@@ -250,30 +249,26 @@ describe("process-domain authentication and concurrent sends", () => {
       );
       if (!isProcessDomainOpenError(failure)) throw failure;
       expect(failure.code).toBe("AUTHENTICATION_FAILED");
-      await server;
+      await serverDone;
     } finally {
-      bootstrap.close();
+      await server.close();
     }
   });
 
-  it("ignores stale ready frames without clearing a newer reconnect attempt", async () => {
+  it("ignores stray control frames after authentication", async () => {
     const env: NodeJS.ProcessEnv = {};
     const root = await openProcessDomain({ env, ...timing });
     const child = await openProcessDomain({ env: { [ENV_NAMES.DECLARATION]: env[ENV_NAMES.DECLARATION] }, ...timing });
     const runtime = child as unknown as {
-      helloClientNonce: string | null;
-      helloServerNonce: string | null;
-      helloAttemptTimer: ReturnType<typeof setTimeout> | null;
-      handleClientEnvelope(envelope: WireEnvelope): Promise<void>;
+      peersMap: Map<string, unknown>;
+      handleClientEnvelope(peer: unknown, envelope: WireEnvelope): Promise<void>;
     };
-    const activeClientNonce = randomId();
-    const activeServerNonce = randomId();
-    const timer = setTimeout(() => {}, 10_000);
-    runtime.helloClientNonce = activeClientNonce;
-    runtime.helloServerNonce = activeServerNonce;
-    runtime.helloAttemptTimer = timer;
+    const hostPeer = runtime.peersMap.get(root.nodeId);
+    if (hostPeer === undefined) throw new Error("missing host peer");
+    const events: string[] = [];
+    const stop = child.subscribeEvents((event) => events.push(event.type));
     try {
-      await runtime.handleClientEnvelope({
+      const forged: WireEnvelope = {
         version: PROCESS_DOMAIN_PROTOCOL,
         type: "ready",
         domainId: child.declaration.domainId,
@@ -287,34 +282,26 @@ describe("process-domain authentication and concurrent sends", () => {
           randomId(),
           randomId(),
         ]),
-      });
-      expect(runtime.helloClientNonce).toBe(activeClientNonce);
-      expect(runtime.helloServerNonce).toBe(activeServerNonce);
-      expect(runtime.helloAttemptTimer).toBe(timer);
-
-      await runtime.handleClientEnvelope({
+      };
+      await runtime.handleClientEnvelope(hostPeer, forged);
+      await runtime.handleClientEnvelope(hostPeer, {
         version: PROCESS_DOMAIN_PROTOCOL,
-        type: "ready",
-        domainId: randomId(),
-        nodeId: root.nodeId,
-        clientNonce: activeClientNonce,
-        serverNonce: activeServerNonce,
-        proof: createProof(child.declaration.capability, "ready", [
-          child.declaration.domainId,
-          root.nodeId,
-          child.nodeId,
-          activeClientNonce,
-          activeServerNonce,
-        ]),
+        type: "challenge",
+        phase: "hello",
+        domainId: child.declaration.domainId,
+        nodeId: child.nodeId,
+        clientNonce: randomId(),
+        serverNonce: randomId(),
       });
-      expect(runtime.helloClientNonce).toBe(activeClientNonce);
-      expect(runtime.helloServerNonce).toBe(activeServerNonce);
-      expect(runtime.helloAttemptTimer).toBe(timer);
+      await runtime.handleClientEnvelope(hostPeer, {
+        version: PROCESS_DOMAIN_PROTOCOL,
+        type: "ack",
+        id: randomId(),
+      });
+      expect(child.peers()).toEqual([expect.objectContaining({ nodeId: root.nodeId, status: "online" })]);
+      expect(events).toEqual([]);
     } finally {
-      clearTimeout(timer);
-      runtime.helloAttemptTimer = null;
-      runtime.helloClientNonce = null;
-      runtime.helloServerNonce = null;
+      stop();
       await child.close();
       await root.close();
     }
@@ -350,48 +337,85 @@ describe("process-domain authentication and concurrent sends", () => {
     expect(env[ENV_NAMES.DECLARATION]).toBeUndefined();
   });
 
-  it("requires hello authentication and rejects replay across connections", async () => {
+  it("requires authentication and rejects replay across connections", async () => {
     const env: NodeJS.ProcessEnv = {};
     const root = await openProcessDomain({ env, ...timing });
     const declaration = decodeDeclaration(env[ENV_NAMES.DECLARATION]);
     if (declaration === null) throw new Error("missing declaration");
-    const peer = await bootstrapRaw(declaration);
+    const injector = await connectRaw(declaration);
+    const peer = await connectRaw(declaration);
     let injected = false;
     const stop = root.subscribe("raw-injection", () => { injected = true; });
     try {
-      await peer.socket.send(encodeEnvelope({
+      await injector.send({
         version: PROCESS_DOMAIN_PROTOCOL,
         type: "data",
         id: randomId(),
         channel: "raw-injection",
-        value: "before-hello",
-        senderId: peer.nodeId,
+        value: "before-auth",
+        senderId: injector.nodeId,
         targetId: root.nodeId,
-      }));
+      });
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(injected).toBe(false);
+      // Fail-closed: an unauthenticated connection sending data is dropped.
+      await wait(injector.closed, 2_000, "injector close");
+      await expect(injector.send({
+        version: PROCESS_DOMAIN_PROTOCOL,
+        type: "data",
+        id: randomId(),
+        channel: "raw-injection",
+        value: "after-drop",
+        senderId: injector.nodeId,
+        targetId: root.nodeId,
+      })).rejects.toThrow("closed");
+      injector.link.close();
+      expect(root.peers()).toEqual([]);
 
-      const oldHello = await authenticateRaw(peer);
+      const staleBootstrap = await authenticateRaw(peer);
       await waitForPeer(root, peer.nodeId, "online");
       const offline = waitForPeer(root, peer.nodeId, "offline");
-      peer.socket.close();
+      peer.link.close();
       await offline;
 
-      peer.socket = new Dealer({ ...socketTiming, routingId: peer.nodeId });
-      const reconnected = wait(new Promise<void>((resolve) => {
-        peer.socket.events.on("handshake", () => resolve());
-      }), 2_000, "reconnect handshake");
-      peer.socket.connect(peer.endpoint);
-      await reconnected;
-      await peer.socket.send(encodeEnvelope(oldHello));
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(root.peers()).toEqual([expect.objectContaining({ nodeId: peer.nodeId, status: "offline" })]);
+      // Replaying the consumed bootstrap on a fresh connection must not authenticate.
+      const replay = await connectRaw(declaration, peer.nodeId);
+      try {
+        await replay.send(staleBootstrap);
+        await wait(replay.closed, 2_000, "replay drop");
+        expect(root.peers()).toEqual([expect.objectContaining({ nodeId: peer.nodeId, status: "offline" })]);
+      } finally {
+        replay.link.close();
+      }
 
-      await authenticateRaw(peer);
-      await waitForPeer(root, peer.nodeId, "online");
+      // Even with a fresh challenge, stale nonces must not validate.
+      const replayWithChallenge = await connectRaw(declaration, peer.nodeId);
+      try {
+        await replayWithChallenge.send({
+          version: PROCESS_DOMAIN_PROTOCOL,
+          type: "challenge-request",
+          phase: "bootstrap",
+          domainId: declaration.domainId,
+          nodeId: peer.nodeId,
+          clientNonce: randomId(),
+        });
+        await replayWithChallenge.receive("replay challenge");
+        await replayWithChallenge.send(staleBootstrap);
+        await wait(replayWithChallenge.closed, 2_000, "replay-with-challenge drop");
+        expect(root.peers()).toEqual([expect.objectContaining({ nodeId: peer.nodeId, status: "offline" })]);
+      } finally {
+        replayWithChallenge.link.close();
+      }
+
+      const replacement = await connectRaw(declaration, peer.nodeId);
+      try {
+        await authenticateRaw(replacement);
+        await waitForPeer(root, peer.nodeId, "online");
+      } finally {
+        replacement.link.close();
+      }
     } finally {
       stop();
-      peer.socket.close();
       await root.close();
     }
   });
@@ -401,37 +425,37 @@ describe("process-domain authentication and concurrent sends", () => {
     const root = await openProcessDomain({ env, ...timing });
     const declaration = decodeDeclaration(env[ENV_NAMES.DECLARATION]);
     if (declaration === null) throw new Error("missing declaration");
-    const peer = await bootstrapRaw(declaration);
+    const peer = await connectRaw(declaration);
     await authenticateRaw(peer);
     await waitForPeer(root, peer.nodeId, "online");
     try {
       let firstResolved = false;
       const first = root.send(peer.nodeId, "ordered", 1).then(() => { firstResolved = true; });
-      const firstEnvelope = await receive(peer.socket);
+      const firstEnvelope = await peer.receive("first data");
       if (firstEnvelope.type !== "data") throw new Error("missing first data");
       const second = root.send(peer.nodeId, "ordered", 2);
-      const secondEnvelope = await receive(peer.socket);
+      const secondEnvelope = await peer.receive("second data");
       if (secondEnvelope.type !== "data") throw new Error("missing second data");
-      await ack(peer.socket, secondEnvelope.id);
+      await ack(peer, secondEnvelope.id);
       await wait(second);
       expect(firstResolved).toBe(false);
-      await ack(peer.socket, firstEnvelope.id);
+      await ack(peer, firstEnvelope.id);
       await wait(first);
 
       const timedOut = root.send(peer.nodeId, "ordered", 3, { timeoutMs: 100 }).then(
         () => null,
         (error: unknown) => error,
       );
-      const thirdEnvelope = await receive(peer.socket);
+      const thirdEnvelope = await peer.receive("third data");
       if (thirdEnvelope.type !== "data") throw new Error("missing third data");
       const fourth = root.send(peer.nodeId, "ordered", 4, { timeoutMs: 500 });
-      const fourthEnvelope = await receive(peer.socket);
+      const fourthEnvelope = await peer.receive("fourth data");
       if (fourthEnvelope.type !== "data") throw new Error("missing fourth data");
-      await ack(peer.socket, fourthEnvelope.id);
+      await ack(peer, fourthEnvelope.id);
       await wait(fourth);
       await expect(timedOut).resolves.toEqual(expect.objectContaining({ message: "process-domain acknowledgement timed out" }));
     } finally {
-      peer.socket.close();
+      peer.link.close();
       await root.close();
     }
   });
@@ -441,17 +465,17 @@ describe("process-domain authentication and concurrent sends", () => {
     const root = await openProcessDomain({ env, ...timing });
     const declaration = decodeDeclaration(env[ENV_NAMES.DECLARATION]);
     if (declaration === null) throw new Error("missing declaration");
-    const peer = await bootstrapRaw(declaration);
+    const peer = await connectRaw(declaration);
     await authenticateRaw(peer);
     await waitForPeer(root, peer.nodeId, "online");
     try {
       const pending = root.send(peer.nodeId, "disconnect", true, { timeoutMs: 5_000 });
-      const envelope = await receive(peer.socket);
+      const envelope = await peer.receive("pending data");
       if (envelope.type !== "data") throw new Error("missing pending data");
-      peer.socket.close();
+      peer.link.close();
       await expect(wait(pending)).rejects.toThrow("disconnected");
     } finally {
-      if (!peer.socket.closed) peer.socket.close();
+      peer.link.close();
       await root.close();
     }
   });

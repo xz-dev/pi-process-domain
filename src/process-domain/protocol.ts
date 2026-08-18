@@ -90,6 +90,16 @@ export type WireEnvelope =
       readonly version: 1;
       readonly type: "ack";
       readonly id: string;
+    }
+  | {
+      readonly version: 1;
+      readonly type: "ping";
+      readonly id: string;
+    }
+  | {
+      readonly version: 1;
+      readonly type: "pong";
+      readonly id: string;
     };
 
 const ID = /^[A-Za-z0-9_-]+$/;
@@ -289,6 +299,8 @@ function isValidEnvelope(value: unknown): value is WireEnvelope {
         isValidLifecycleEvent(value.event)
       );
     case "ack":
+    case "ping":
+    case "pong":
       return hasExactKeys(value, ["version", "type", "id"]) && isValidId(value.id);
     default:
       return false;

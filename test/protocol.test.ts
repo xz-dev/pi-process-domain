@@ -43,10 +43,17 @@ describe("process-domain protocol validation", () => {
     expect(decodeEnvelope(encoded)).toEqual(valid);
     expect(encoded.toString("utf8")).not.toContain(capability);
 
+    const ping: WireEnvelope = { version: PROCESS_DOMAIN_PROTOCOL, type: "ping", id: randomId() };
+    const pong: WireEnvelope = { version: PROCESS_DOMAIN_PROTOCOL, type: "pong", id: randomId() };
+    expect(decodeEnvelope(encodeEnvelope(ping))).toEqual(ping);
+    expect(decodeEnvelope(encodeEnvelope(pong))).toEqual(pong);
+
     expect(() => decodeEnvelope(frame({ ...valid, extra: true }))).toThrow("invalid process-domain envelope");
     expect(() => decodeEnvelope(frame({ ...valid, clientNonce: "bad nonce" }))).toThrow("invalid process-domain envelope");
     expect(() => decodeEnvelope(frame({ ...valid, proof: 1 }))).toThrow("invalid process-domain envelope");
     expect(() => decodeEnvelope(frame({ version: 1, type: "ack", id: "bad id" }))).toThrow("invalid process-domain envelope");
+    expect(() => decodeEnvelope(frame({ version: 1, type: "ping", id: randomId(), extra: true }))).toThrow("invalid process-domain envelope");
+    expect(() => decodeEnvelope(frame({ version: 1, type: "pong" }))).toThrow("invalid process-domain envelope");
     expect(() => decodeEnvelope(frame({ version: 1, type: "data", id: randomId(), channel: "bad channel!", value: null, senderId: randomId(), targetId: "*" }))).toThrow("invalid process-domain envelope");
     expect(() => decodeEnvelope(frame({ version: 1, type: "lifecycle", id: randomId(), senderId: randomId(), event: { name: "unknown", at: 1 } }))).toThrow("invalid process-domain envelope");
   });

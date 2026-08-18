@@ -3,6 +3,37 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { openProcessDomain, ENV_NAMES, preferredTransport } from "../dist/process-domain/index.js";
 
+const denoRuntime = globalThis.Deno;
+const runtime = denoRuntime?.version?.deno ? "deno" : globalThis.Bun?.version ? "bun" : "node";
+const harnessPath = fileURLToPath(new URL("./harness-child.mjs", import.meta.url));
+const childArguments = runtime === "deno" ? ["run", "--allow-all", harnessPath] : [harnessPath];
+
+function signalChild(child, signal, bestEffort = false) {
+  try {
+    if (runtime === "deno") {
+      // Deno's node:child_process shim treats `killed` as a one-shot guard:
+      // after SIGSTOP succeeds, ChildProcess.kill("SIGCONT") returns false
+      // without issuing a system call. Deno.kill has the required Node semantics.
+      if (!Number.isSafeInteger(child.pid)) throw new Error("child pid is unavailable");
+      denoRuntime.kill(child.pid, signal);
+      return true;
+    }
+    const delivered = child.kill(signal);
+    if (!delivered && !bestEffort && child.exitCode === null) throw new Error(`failed to deliver ${signal}`);
+    return delivered;
+  } catch (error) {
+    if (bestEffort) return false;
+    throw error;
+  }
+}
+
+async function terminateChild(child) {
+  if (child.exitCode !== null) return;
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  signalChild(child, "SIGTERM");
+  await exited;
+}
+
 const env = {};
 const root = await openProcessDomain({
   env,
@@ -15,7 +46,7 @@ let child;
 try {
   assert.equal(root.transport, preferredTransport());
   assert.equal(root.endpoint.includes("pi-extension-utils"), false);
-  child = spawn(process.execPath, [fileURLToPath(new URL("./harness-child.mjs", import.meta.url))], {
+  child = spawn(process.execPath, childArguments, {
     env: { ...process.env, [ENV_NAMES.DECLARATION]: env[ENV_NAMES.DECLARATION] },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -44,11 +75,11 @@ try {
       }
     });
   });
-  if (process.platform === "win32") child.kill();
-  else child.kill("SIGSTOP");
+  if (process.platform === "win32") signalChild(child, "SIGTERM");
+  else signalChild(child, "SIGSTOP");
   await Promise.race([
     offline,
-    new Promise((_, reject) => setTimeout(() => reject(new Error("ZMTP liveness did not report the child offline")), 5000)),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("transport liveness did not report the child offline")), 5000)),
   ]);
   if (process.platform !== "win32") {
     const online = new Promise((resolve) => {
@@ -59,7 +90,7 @@ try {
         }
       });
     });
-    child.kill("SIGCONT");
+    signalChild(child, "SIGCONT");
     await Promise.race([
       online,
       new Promise((_, reject) => setTimeout(() => reject(new Error("child did not reauthenticate after reconnect")), 5000)),
@@ -72,13 +103,12 @@ try {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
   }
-  child.kill("SIGTERM");
-  await new Promise((resolve) => child.once("exit", resolve));
-  console.log(JSON.stringify({ ok: true, transport: root.transport }));
+  await terminateChild(child);
+  console.log(JSON.stringify({ ok: true, transport: root.transport, runtime }));
 } finally {
   if (child?.exitCode === null) {
-    if (process.platform !== "win32") child.kill("SIGCONT");
-    child.kill("SIGTERM");
+    if (process.platform !== "win32") signalChild(child, "SIGCONT", true);
+    signalChild(child, "SIGTERM", true);
   }
   await root.close();
 }

@@ -50,6 +50,8 @@
     "test": "vitest run",
     "test:unit": "vitest run test/*.test.ts",
     "test:acceptance": "node test/run-acceptance.mjs",
+    "test:acceptance:bun": "bun test/run-acceptance.mjs",
+    "test:acceptance:deno": "deno run --allow-all test/run-acceptance.mjs",
     "check": "npm run typecheck && npm run lint && npm run build:dist && npm run test:unit && npm run test:acceptance"
   },
   "devDependencies": {
@@ -60,11 +62,5 @@
     "typescript": "~5.9.2",
     "typescript-eslint": "^8.57.0",
     "vitest": "^4.1.0"
-  },
-  "dependencies": {
-    "zeromq": "^6.6.0"
-  },
-  "allowScripts": {
-    "zeromq": true
   }
 }

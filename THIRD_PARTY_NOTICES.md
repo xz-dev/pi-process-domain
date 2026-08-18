@@ -1,12 +1,6 @@
 # Third-Party Notices
 
-## zeromq
-
-This package depends on [`zeromq`](https://github.com/zeromq/zeromq.js), the official Node.js bindings for libzmq.
-
-- zeromq.js license: MIT
-- libzmq license: Mozilla Public License 2.0
-- The installed package includes the corresponding license texts.
+This package has no runtime third-party dependencies.
 
 ## MIT License (this package)
 

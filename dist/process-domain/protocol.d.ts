@@ -72,6 +72,14 @@ export type WireEnvelope = {
     readonly version: 1;
     readonly type: "ack";
     readonly id: string;
+} | {
+    readonly version: 1;
+    readonly type: "ping";
+    readonly id: string;
+} | {
+    readonly version: 1;
+    readonly type: "pong";
+    readonly id: string;
 };
 export declare function randomId(bytes?: number): string;
 export declare function isValidId(value: unknown): value is string;
