@@ -43,6 +43,13 @@ function customTypeOf(value) {
         ? value.customType
         : null;
 }
+function sameCorrelation(left, right) {
+    return left !== null &&
+        left.version === right.version &&
+        left.namespace === right.namespace &&
+        left.inquiryId === right.inquiryId &&
+        left.attempt === right.attempt;
+}
 function roleOf(value) {
     return isObject(value) && typeof value.role === "string" ? value.role : null;
 }
@@ -215,8 +222,10 @@ function findSegment(messages, startIndex, start, namespace) {
             continue;
         }
         if (role === "assistant") {
-            if (isAbortedAssistant(message))
+            if (isAbortedAssistant(message) &&
+                isNeutralizedAssistant(message, namespace, start.inquiryId, attempt)) {
                 return { kind: "aborted", endIndex: index };
+            }
             continue;
         }
         if (role === "toolResult")
@@ -251,7 +260,24 @@ export function createInquiryRuntime(namespace, options = {}) {
             details: correlation(attempt),
         };
     };
-    return {
+    const fold = (attempt, replacement) => {
+        if (replacement !== undefined &&
+            (replacementOf(replacement) === null ||
+                (Object.hasOwn(replacement, "details") && !serializable(replacement.details)))) {
+            throw new TypeError("invalid inquiry replacement");
+        }
+        return {
+            customType: `${namespace}:inquiry-fold`,
+            content: replacement?.content ?? "",
+            display: false,
+            details: {
+                ...correlation(attempt),
+                outcome: replacement === undefined ? "remove" : "replace",
+                ...(replacement === undefined ? {} : { replacement }),
+            },
+        };
+    };
+    const runtime = {
         inquiryId,
         namespace,
         correlation,
@@ -261,30 +287,62 @@ export function createInquiryRuntime(namespace, options = {}) {
             pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
             return message;
         },
-        fold(attempt, replacement) {
-            if (replacement !== undefined &&
-                (replacementOf(replacement) === null ||
-                    (Object.hasOwn(replacement, "details") && !serializable(replacement.details)))) {
-                throw new TypeError("invalid inquiry replacement");
-            }
-            return {
-                customType: `${namespace}:inquiry-fold`,
-                content: replacement?.content ?? "",
-                display: false,
-                details: {
-                    ...correlation(attempt),
-                    outcome: replacement === undefined ? "remove" : "replace",
-                    ...(replacement === undefined ? {} : { replacement }),
-                },
-            };
-        },
+        fold,
         capture(message) {
             return roleOf(message) === "assistant" ? nonThinkingText(message) : null;
         },
         neutralize(message, attempt) {
             return neutralizeInquiryAssistant(message, correlation(attempt));
         },
+        attempt(attemptNumber) {
+            const attemptCorrelation = correlation(attemptNumber);
+            let state = "pending";
+            let cancellation = null;
+            return {
+                correlation: attemptCorrelation,
+                get state() {
+                    return state;
+                },
+                prompt(content) {
+                    return prompt(content, attemptNumber);
+                },
+                markSent() {
+                    if (state !== "pending")
+                        return false;
+                    state = "sent";
+                    return true;
+                },
+                matchesPrompt(message) {
+                    return isObject(message) &&
+                        customTypeOf(message) === `${namespace}:inquiry` &&
+                        sameCorrelation(correlationOf(message.details), attemptCorrelation);
+                },
+                capture(message) {
+                    if (state === "cancelled" || state === "completed")
+                        return null;
+                    return roleOf(message) === "assistant" ? nonThinkingText(message) : null;
+                },
+                complete(replacement) {
+                    if (state === "cancelled" || state === "completed")
+                        return null;
+                    const result = fold(attemptNumber, replacement);
+                    state = "completed";
+                    return result;
+                },
+                cancel() {
+                    if (state === "completed")
+                        return null;
+                    cancellation ??= fold(attemptNumber);
+                    state = "cancelled";
+                    return cancellation;
+                },
+                neutralize(message, options) {
+                    return neutralizeInquiryAssistant(message, attemptCorrelation, options);
+                },
+            };
+        },
     };
+    return runtime;
 }
 export function foldInquiryContext(messages, namespace) {
     if (!Array.isArray(messages) || !validNamespace(namespace))

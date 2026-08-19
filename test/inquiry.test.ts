@@ -147,17 +147,28 @@ describe("Pi inquiry lifecycle", () => {
     expect(foldInquiryContext(messages, namespace)).toEqual([]);
   });
 
-  it("removes a canonical aborted inquiry without a fold marker", () => {
+  it("removes only an exactly correlated aborted inquiry without a fold marker", () => {
     const inquiry = createInquiryRuntime(namespace, { inquiryId });
+    const attempt = inquiry.attempt(1);
     const before = { role: "user", content: "before", timestamp: 1 };
     const after = { role: "user", content: "after", timestamp: 4 };
     const messages = [
       before,
-      persisted(inquiry.prompt("first", 1), 2),
-      assistant("partial", 3, "aborted"),
+      persisted(attempt.prompt("first"), 2),
+      attempt.neutralize(assistant("partial", 3, "aborted"), {
+        stopReason: "aborted",
+      }),
       after,
     ];
     expect(foldInquiryContext(messages, namespace)).toEqual([before, after]);
+
+    const unrelatedAbort = [
+      before,
+      persisted(attempt.prompt("first"), 2),
+      assistant("unrelated", 3, "aborted"),
+      after,
+    ];
+    expect(foldInquiryContext(unrelatedAbort, namespace)).toBe(unrelatedAbort);
   });
 
   it("fails closed on skipped attempts, interleaved user input, and malformed records", () => {
@@ -207,6 +218,47 @@ describe("Pi inquiry lifecycle", () => {
       rawAssistant,
       separator,
     ]);
+  });
+
+  it("owns cancellation and completion with a terminal attempt handle", () => {
+    const inquiry = createInquiryRuntime(namespace, { inquiryId });
+    const attempt = inquiry.attempt(2);
+    const prompt = attempt.prompt("decide");
+
+    expect(attempt.state).toBe("pending");
+    expect(attempt.matchesPrompt(prompt)).toBe(true);
+    expect(attempt.matchesPrompt(inquiry.prompt("other", 1))).toBe(false);
+    expect(attempt.markSent()).toBe(true);
+    expect(attempt.markSent()).toBe(false);
+    expect(attempt.capture(assistant("answer", 1))).toBe("answer");
+
+    const cancellation = attempt.cancel();
+    expect(cancellation).not.toBeNull();
+    expect(attempt.state).toBe("cancelled");
+    expect(attempt.cancel()).toBe(cancellation);
+    expect(attempt.complete()).toBeNull();
+    expect(attempt.capture(assistant("late", 2))).toBeNull();
+
+    const completed = inquiry.attempt(3);
+    const fold = completed.complete({
+      customType: "test.plugin:result",
+      content: "done",
+    });
+    expect(fold?.details.outcome).toBe("replace");
+    expect(completed.state).toBe("completed");
+    expect(completed.complete()).toBeNull();
+    expect(completed.cancel()).toBeNull();
+  });
+
+  it("neutralizes with exact attempt correlation and preserves other details", () => {
+    const attempt = createInquiryRuntime(namespace, { inquiryId }).attempt(1);
+    const message = { ...assistant("partial", 1, "aborted"), details: { keep: true } };
+    expect(attempt.neutralize(message, { stopReason: "stop" })).toEqual({
+      ...message,
+      content: [],
+      stopReason: "stop",
+      details: { keep: true, piInquiry: attempt.correlation },
+    });
   });
 
   it("registers a context transform and validates builder inputs", () => {

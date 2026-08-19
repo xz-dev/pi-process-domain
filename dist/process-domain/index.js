@@ -12,8 +12,7 @@ const DEFAULT_HEARTBEAT_TIMEOUT_MS = 6_000;
 const DEFAULT_HEARTBEAT_TTL_MS = 5_000;
 const AUTH_CHALLENGE_TTL_MS = 10_000;
 const MAX_PENDING_AUTH = 1_024;
-const RECONNECT_MIN_DELAY_MS = 100;
-const RECONNECT_MAX_DELAY_MS = 2_000;
+const RECONNECT_DELAY_MS = 1_000;
 function asError(error) {
     return error instanceof Error ? error : new Error(String(error));
 }
@@ -133,7 +132,6 @@ class DomainRuntime {
     pendingAuth = new Set();
     ownLink = null;
     reconnectTimer = null;
-    reconnectDelayMs = RECONNECT_MIN_DELAY_MS;
     declarationEnv = null;
     publishedDeclaration = null;
     constructor(role, nodeId, declaration, transport, options, metadata) {
@@ -552,7 +550,6 @@ class DomainRuntime {
         };
         this.peersMap.set(hostNodeId, peer);
         this.ownLink = link;
-        this.reconnectDelayMs = RECONNECT_MIN_DELAY_MS;
         // Online before attaching the dispatcher: frames that were coalesced with
         // the handshake-complete frame are drained through the online peer.
         this.markOnline();
@@ -579,12 +576,10 @@ class DomainRuntime {
     scheduleReconnect() {
         if (this.closed || this.role !== "client" || this.reconnectTimer !== null)
             return;
-        const delay = this.reconnectDelayMs;
-        this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, RECONNECT_MAX_DELAY_MS);
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
             void this.reconnectAttempt();
-        }, delay);
+        }, RECONNECT_DELAY_MS);
     }
     async reconnectAttempt() {
         if (this.closed)

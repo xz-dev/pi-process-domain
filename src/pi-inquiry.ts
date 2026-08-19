@@ -48,6 +48,32 @@ export interface InquiryContextApi {
   ): void;
 }
 
+export type InquiryAttemptState =
+  | "pending"
+  | "sent"
+  | "completed"
+  | "cancelled";
+
+/**
+ * Pure, per-attempt inquiry ownership. The Pi adapter remains responsible for
+ * aborting an active turn and delivering the returned fold message.
+ */
+export interface InquiryAttemptHandle {
+  readonly correlation: InquiryCorrelation;
+  readonly state: InquiryAttemptState;
+  prompt(content: string): InquiryMessage;
+  markSent(): boolean;
+  matchesPrompt(message: unknown): boolean;
+  capture(message: unknown): string | null;
+  complete(replacement?: InquiryReplacement): InquiryFoldMessage | null;
+  /** Idempotently returns the same remove-fold after cancellation. */
+  cancel(): InquiryFoldMessage | null;
+  neutralize<T>(
+    message: T,
+    options?: { readonly stopReason?: "stop" | "aborted" },
+  ): T;
+}
+
 export interface InquiryRuntime {
   readonly inquiryId: string;
   readonly namespace: string;
@@ -57,6 +83,7 @@ export interface InquiryRuntime {
   fold(attempt: number, replacement?: InquiryReplacement): InquiryFoldMessage;
   capture(message: unknown): string | null;
   neutralize<T>(message: T, attempt: number): T;
+  attempt(attempt: number): InquiryAttemptHandle;
 }
 
 type ParsedPluginMessage =
@@ -128,6 +155,17 @@ function customTypeOf(value: unknown): string | null {
   return isObject(value) && typeof value.customType === "string"
     ? value.customType
     : null;
+}
+
+function sameCorrelation(
+  left: InquiryCorrelation | null,
+  right: InquiryCorrelation,
+): boolean {
+  return left !== null &&
+    left.version === right.version &&
+    left.namespace === right.namespace &&
+    left.inquiryId === right.inquiryId &&
+    left.attempt === right.attempt;
 }
 
 function roleOf(value: unknown): string | null {
@@ -342,7 +380,12 @@ function findSegment<T extends object>(
       continue;
     }
     if (role === "assistant") {
-      if (isAbortedAssistant(message)) return { kind: "aborted", endIndex: index };
+      if (
+        isAbortedAssistant(message) &&
+        isNeutralizedAssistant(message, namespace, start.inquiryId, attempt)
+      ) {
+        return { kind: "aborted", endIndex: index };
+      }
       continue;
     }
     if (role === "toolResult") continue;
@@ -379,7 +422,30 @@ export function createInquiryRuntime(
     };
   };
 
-  return {
+  const fold = (
+    attempt: number,
+    replacement?: InquiryReplacement,
+  ): InquiryFoldMessage => {
+    if (
+      replacement !== undefined &&
+      (replacementOf(replacement) === null ||
+        (Object.hasOwn(replacement, "details") && !serializable(replacement.details)))
+    ) {
+      throw new TypeError("invalid inquiry replacement");
+    }
+    return {
+      customType: `${namespace}:inquiry-fold`,
+      content: replacement?.content ?? "",
+      display: false,
+      details: {
+        ...correlation(attempt),
+        outcome: replacement === undefined ? "remove" : "replace",
+        ...(replacement === undefined ? {} : { replacement }),
+      },
+    };
+  };
+
+  const runtime: InquiryRuntime = {
     inquiryId,
     namespace,
     correlation,
@@ -389,32 +455,62 @@ export function createInquiryRuntime(
       pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
       return message;
     },
-    fold(attempt, replacement) {
-      if (
-        replacement !== undefined &&
-        (replacementOf(replacement) === null ||
-          (Object.hasOwn(replacement, "details") && !serializable(replacement.details)))
-      ) {
-        throw new TypeError("invalid inquiry replacement");
-      }
-      return {
-        customType: `${namespace}:inquiry-fold`,
-        content: replacement?.content ?? "",
-        display: false,
-        details: {
-          ...correlation(attempt),
-          outcome: replacement === undefined ? "remove" : "replace",
-          ...(replacement === undefined ? {} : { replacement }),
-        },
-      };
-    },
+    fold,
     capture(message) {
       return roleOf(message) === "assistant" ? nonThinkingText(message) : null;
     },
     neutralize(message, attempt) {
       return neutralizeInquiryAssistant(message, correlation(attempt));
     },
+    attempt(attemptNumber) {
+      const attemptCorrelation = correlation(attemptNumber);
+      let state: InquiryAttemptState = "pending";
+      let cancellation: InquiryFoldMessage | null = null;
+      return {
+        correlation: attemptCorrelation,
+        get state(): InquiryAttemptState {
+          return state;
+        },
+        prompt(content) {
+          return prompt(content, attemptNumber);
+        },
+        markSent(): boolean {
+          if (state !== "pending") return false;
+          state = "sent";
+          return true;
+        },
+        matchesPrompt(message): boolean {
+          return isObject(message) &&
+            customTypeOf(message) === `${namespace}:inquiry` &&
+            sameCorrelation(correlationOf(message.details), attemptCorrelation);
+        },
+        capture(message): string | null {
+          if (state === "cancelled" || state === "completed") return null;
+          return roleOf(message) === "assistant" ? nonThinkingText(message) : null;
+        },
+        complete(replacement): InquiryFoldMessage | null {
+          if (state === "cancelled" || state === "completed") return null;
+          const result = fold(attemptNumber, replacement);
+          state = "completed";
+          return result;
+        },
+        cancel(): InquiryFoldMessage | null {
+          if (state === "completed") return null;
+          cancellation ??= fold(attemptNumber);
+          state = "cancelled";
+          return cancellation;
+        },
+        neutralize(message, options) {
+          return neutralizeInquiryAssistant(
+            message,
+            attemptCorrelation,
+            options,
+          );
+        },
+      };
+    },
   };
+  return runtime;
 }
 
 export function foldInquiryContext<T extends object>(

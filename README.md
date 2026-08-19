@@ -12,7 +12,7 @@ Shared utilities for Pi extensions. The package exposes independent entry points
 - one listener on an ephemeral loopback port (`tcp://127.0.0.1:*`); every peer is one exact connection, so a disconnect maps to one exact node;
 - an inherited authenticated declaration in `PI_EXTENSION_UTILS_PROCESS_DOMAIN`.
 
-The wire format is a 4-byte big-endian length prefix carrying a strictly validated JSON envelope (64 KiB bound, fail-closed). Authentication is a per-connection HMAC challenge-response: fresh nonces on every connection make consumed proofs useless for replay, and a reconnecting peer fences and replaces its stale incarnation. Reconnects open a brand-new connection and rerun the full handshake; pending sends fail instead of being replayed. A receipt acknowledgement resolves once the message reaches the target peer; routed messages acknowledge only after every downstream hop acknowledged.
+The wire format is a 4-byte big-endian length prefix carrying a strictly validated JSON envelope (64 KiB bound, fail-closed). Authentication is a per-connection HMAC challenge-response: fresh nonces on every connection make consumed proofs useless for replay, and a reconnecting peer fences and replaces its stale incarnation. Disconnected clients retry connection every fixed 1 second, open a brand-new connection, and rerun the full handshake; pending sends fail instead of being replayed. Consumers receive the online peer event and must publish any newly queried business state themselves. A receipt acknowledgement resolves once the message reaches the target peer; routed messages acknowledge only after every downstream hop acknowledged.
 
 ```ts
 import { attachPiLifecycle, openProcessDomain } from "pi-extension-utils/process-domain";
@@ -45,7 +45,9 @@ const result = parseTrailingXml(`Checked.\n${example}`, "reflection");
 
 ## Pi inquiry
 
-`pi-extension-utils/pi-inquiry` creates correlated hidden inquiry and fold messages, neutralizes inquiry assistants, and registers provider-context folding. Business validation and retry state remain in the consuming extension.
+`pi-extension-utils/pi-inquiry` creates correlated hidden inquiry and fold messages, neutralizes inquiry assistants, and registers provider-context folding. Business validation and retry policy remain in the consuming extension.
+
+`createInquiryRuntime(namespace).attempt(n)` returns one pure terminal handle with immutable correlation and `pending | sent | completed | cancelled` state. It matches only its exact prompt, blocks capture after terminal cancellation, makes completion first-terminal-wins, and makes cancellation idempotently return the same remove-fold for retry. Its `neutralize()` helper clears assistant content while preserving exact correlation. Context folding removes an aborted exchange without a fold marker only when the assistant was neutralized with that exact correlation. The utility does not import Pi types, call `ctx.abort()`, enqueue user input, or decide business outcomes.
 
 ## Runtime support
 

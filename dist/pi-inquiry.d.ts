@@ -39,6 +39,25 @@ export interface InquiryContextApi {
         messages?: object[];
     }): void;
 }
+export type InquiryAttemptState = "pending" | "sent" | "completed" | "cancelled";
+/**
+ * Pure, per-attempt inquiry ownership. The Pi adapter remains responsible for
+ * aborting an active turn and delivering the returned fold message.
+ */
+export interface InquiryAttemptHandle {
+    readonly correlation: InquiryCorrelation;
+    readonly state: InquiryAttemptState;
+    prompt(content: string): InquiryMessage;
+    markSent(): boolean;
+    matchesPrompt(message: unknown): boolean;
+    capture(message: unknown): string | null;
+    complete(replacement?: InquiryReplacement): InquiryFoldMessage | null;
+    /** Idempotently returns the same remove-fold after cancellation. */
+    cancel(): InquiryFoldMessage | null;
+    neutralize<T>(message: T, options?: {
+        readonly stopReason?: "stop" | "aborted";
+    }): T;
+}
 export interface InquiryRuntime {
     readonly inquiryId: string;
     readonly namespace: string;
@@ -48,6 +67,7 @@ export interface InquiryRuntime {
     fold(attempt: number, replacement?: InquiryReplacement): InquiryFoldMessage;
     capture(message: unknown): string | null;
     neutralize<T>(message: T, attempt: number): T;
+    attempt(attempt: number): InquiryAttemptHandle;
 }
 export declare function createInquiryRuntime(namespace: string, options?: {
     readonly inquiryId?: string;
