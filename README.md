@@ -49,6 +49,21 @@ const result = parseTrailingXml(`Checked.\n${example}`, "reflection");
 
 `createInquiryRuntime(namespace).attempt(n)` returns one pure terminal handle with immutable correlation and `pending | sent | completed | cancelled` state. It matches only its exact prompt, blocks capture after terminal cancellation, makes completion first-terminal-wins, and makes cancellation idempotently return the same remove-fold for retry. Its `neutralize()` helper clears assistant content while preserving exact correlation. Context folding removes an aborted exchange without a fold marker only when the assistant was neutralized with that exact correlation. The utility does not import Pi types, call `ctx.abort()`, enqueue user input, or decide business outcomes.
 
+## Pi agent state
+
+`pi-extension-utils/pi-agent-state` provides one dependency-free live probe over Pi's public extension context. `probePiAgentState(ctx)` queries `ctx.isIdle()` and, when available, `ctx.hasPendingMessages()` exactly once per call and returns `{ idle, busy, pendingMessages }`.
+
+Call it at each relevant public Pi event instead of inferring busy/idle from event names. The helper deliberately owns no cache, lifecycle state machine, timers, cross-process aggregation, or watchdog policy; those remain with the consuming extension.
+
+```ts
+import { probePiAgentState } from "pi-extension-utils/pi-agent-state";
+
+pi.on("agent_start", (_event, ctx) => {
+  const state = probePiAgentState(ctx);
+  publishBusy(state.busy);
+});
+```
+
 ## Runtime support
 
 process-domain relies only on the portable `node:net`/`node:crypto` surface and runs the same TypeScript on Node.js, Bun, and Deno, including their standalone compiled forms. The same full liveness/reconnect acceptance file runs under all three hosts (`test:acceptance`, `test:acceptance:bun`, and `test:acceptance:deno`). The Deno harness uses `Deno.kill()` for Unix stop/continue signals because Deno 2.9.5's `node:child_process` shim incorrectly treats `killed` as a one-shot guard: after a successful `SIGSTOP`, `ChildProcess.kill("SIGCONT")` returns `false` without sending the signal. This is a Deno Node-compatibility bug, not a transport limitation. Compiled Bun and Deno host startup smoke tests are also verified.

@@ -35,6 +35,10 @@
       "types": "./dist/pi-inquiry.d.ts",
       "import": "./dist/pi-inquiry.js"
     },
+    "./pi-agent-state": {
+      "types": "./dist/pi-agent-state.d.ts",
+      "import": "./dist/pi-agent-state.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
